@@ -1,0 +1,481 @@
+"""SQLite stand-in for Azure Table Storage (roster + sent fingerprints)."""
+
+from __future__ import annotations
+
+import json
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator
+
+from pipeline.config import settings
+from pipeline.models import Opportunity, SiteMetrics, Spokesperson
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS roster (
+    person_id     TEXT PRIMARY KEY,
+    firm          TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    title         TEXT,
+    linkedin      TEXT,
+    topics        TEXT,
+    prior_work    TEXT,
+    bio           TEXT,
+    email         TEXT,
+    synced_at     TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sent_opportunities (
+    person_id   TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    title       TEXT,
+    outlet      TEXT,
+    sent_at     TEXT NOT NULL,
+    PRIMARY KEY (person_id, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sent_person ON sent_opportunities(person_id);
+CREATE INDEX IF NOT EXISTS idx_sent_fingerprint ON sent_opportunities(fingerprint);
+
+CREATE TABLE IF NOT EXISTS semrush_domains (
+    domain     TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS opportunity_feedback (
+    token            TEXT PRIMARY KEY,
+    person_id        TEXT NOT NULL,
+    person_name      TEXT NOT NULL,
+    fingerprint      TEXT NOT NULL,
+    url              TEXT NOT NULL,
+    title            TEXT,
+    outlet           TEXT,
+    opportunity_type TEXT,
+    why_relevant     TEXT,
+    suggested_angle  TEXT,
+    verdict          TEXT,
+    reason           TEXT,
+    created_at       TEXT NOT NULL,
+    decided_at       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_fingerprint
+    ON opportunity_feedback(fingerprint);
+"""
+
+
+@dataclass
+class FeedbackRecord:
+    token: str
+    person_id: str
+    person_name: str
+    fingerprint: str
+    url: str
+    title: str
+    outlet: str
+    opportunity_type: str
+    why_relevant: str
+    suggested_angle: str
+    verdict: str
+    reason: str
+    created_at: str
+    decided_at: str
+
+
+class LocalStore:
+    def __init__(self, db_path: Path | None = None) -> None:
+        self.db_path = db_path or settings.db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+
+    @contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _init_schema(self) -> None:
+        with self._conn() as conn:
+            conn.executescript(SCHEMA)
+            self._ensure_column(conn, "roster", "first_seen_at", "TEXT")
+
+    def _ensure_column(
+        self, conn: sqlite3.Connection, table: str, column: str, decl: str
+    ) -> None:
+        cols = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column in cols:
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        if column == "first_seen_at":
+            conn.execute(
+                "UPDATE roster SET first_seen_at = synced_at "
+                "WHERE first_seen_at IS NULL OR first_seen_at = ''"
+            )
+
+    def roster_ids(self) -> set[str]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT person_id FROM roster").fetchall()
+        return {r["person_id"] for r in rows}
+
+    def sync_roster(self, people: list[Spokesperson]) -> tuple[int, list[Spokesperson]]:
+        """Upsert the current Excel roster. Returns (count, newly added people)."""
+        now = datetime.now(timezone.utc).isoformat()
+        existing = self.roster_ids()
+        newcomers = [p for p in people if p.person_id not in existing]
+        incoming_ids = [p.person_id for p in people]
+
+        with self._conn() as conn:
+            conn.executemany(
+                """
+                INSERT INTO roster
+                (person_id, firm, name, title, linkedin, topics, prior_work,
+                 bio, email, synced_at, first_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(person_id) DO UPDATE SET
+                    firm = excluded.firm,
+                    name = excluded.name,
+                    title = excluded.title,
+                    linkedin = excluded.linkedin,
+                    topics = excluded.topics,
+                    prior_work = excluded.prior_work,
+                    bio = excluded.bio,
+                    email = excluded.email,
+                    synced_at = excluded.synced_at
+                """,
+                [
+                    (
+                        p.person_id,
+                        p.firm,
+                        p.name,
+                        p.title,
+                        p.linkedin,
+                        p.topics,
+                        p.prior_work,
+                        p.bio,
+                        p.email,
+                        now,
+                        now,
+                    )
+                    for p in people
+                ],
+            )
+            if incoming_ids:
+                placeholders = ",".join("?" for _ in incoming_ids)
+                conn.execute(
+                    f"DELETE FROM roster WHERE person_id NOT IN ({placeholders})",
+                    incoming_ids,
+                )
+            else:
+                conn.execute("DELETE FROM roster")
+        return len(people), newcomers
+
+    def list_roster(self) -> list[Spokesperson]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM roster ORDER BY firm, name"
+            ).fetchall()
+        return [
+            Spokesperson(
+                person_id=r["person_id"],
+                firm=r["firm"],
+                name=r["name"],
+                title=r["title"] or "",
+                linkedin=r["linkedin"] or "",
+                topics=r["topics"] or "",
+                prior_work=r["prior_work"] or "",
+                bio=r["bio"] or "",
+                email=r["email"],
+            )
+            for r in rows
+        ]
+
+    def already_sent(self, person_id: str, fingerprint: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM sent_opportunities
+                WHERE person_id = ? AND fingerprint = ?
+                """,
+                (person_id, fingerprint),
+            ).fetchone()
+        return row is not None
+
+    def filter_new(
+        self, person_id: str, opportunities: list[Opportunity]
+    ) -> list[Opportunity]:
+        """Drop URLs already filed for this person in sent_opportunities."""
+        seen: set[str] = set()
+        fresh: list[Opportunity] = []
+        for opp in opportunities:
+            if not opp.fingerprint:
+                continue
+            if opp.fingerprint in seen:
+                continue
+            if self.already_sent(person_id, opp.fingerprint):
+                continue
+            seen.add(opp.fingerprint)
+            fresh.append(opp)
+        return fresh
+
+    def record_sent(
+        self, person_id: str, opportunities: list[Opportunity]
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO sent_opportunities
+                (person_id, fingerprint, url, title, outlet, sent_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        person_id,
+                        o.fingerprint,
+                        o.url,
+                        o.title,
+                        o.outlet,
+                        now,
+                    )
+                    for o in opportunities
+                    if o.fingerprint
+                ],
+            )
+
+    def sent_count(self, person_id: str | None = None) -> int:
+        with self._conn() as conn:
+            if person_id:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM sent_opportunities WHERE person_id = ?",
+                    (person_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM sent_opportunities"
+                ).fetchone()
+        return int(row["n"])
+
+    def get_semrush_cache(
+        self,
+        domain: str,
+        max_age_days: int,
+        *,
+        now: datetime | None = None,
+    ) -> SiteMetrics | None:
+        """Return a still-fresh Semrush snapshot, or None if missing/stale."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT payload, fetched_at FROM semrush_domains WHERE domain = ?",
+                (domain,),
+            ).fetchone()
+        if row is None:
+            return None
+        fetched_at = row["fetched_at"] or ""
+        try:
+            fetched = datetime.fromisoformat(fetched_at)
+        except ValueError:
+            return None
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        age = (now or datetime.now(timezone.utc)) - fetched
+        if age.days > max_age_days:
+            return None
+        try:
+            data = json.loads(row["payload"])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return SiteMetrics.model_validate(data)
+
+    def put_semrush_cache(self, metrics: SiteMetrics) -> None:
+        domain = (metrics.domain or "").strip().lower()
+        if not domain:
+            return
+        fetched_at = metrics.fetched_at or datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO semrush_domains (domain, payload, fetched_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(domain) DO UPDATE SET
+                    payload = excluded.payload,
+                    fetched_at = excluded.fetched_at
+                """,
+                (domain, metrics.model_dump_json(), fetched_at),
+            )
+
+    def export_debug(self) -> str:
+        with self._conn() as conn:
+            roster = [dict(r) for r in conn.execute("SELECT * FROM roster")]
+            sent = [
+                dict(r) for r in conn.execute("SELECT * FROM sent_opportunities")
+            ]
+            semrush = [
+                dict(r) for r in conn.execute("SELECT * FROM semrush_domains")
+            ]
+            feedback = [
+                dict(r) for r in conn.execute("SELECT * FROM opportunity_feedback")
+            ]
+        return json.dumps(
+            {
+                "roster": roster,
+                "sent": sent,
+                "semrush": semrush,
+                "feedback": feedback,
+            },
+            indent=2,
+        )
+
+    def issue_feedback(
+        self, person: Spokesperson, opportunities: list[Opportunity]
+    ) -> None:
+        """Attach a stable Yes/No token to each opportunity and store a pending row."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            for opp in opportunities:
+                if not opp.fingerprint:
+                    continue
+                existing = conn.execute(
+                    """
+                    SELECT token FROM opportunity_feedback
+                    WHERE person_id = ? AND fingerprint = ? AND verdict IS NULL
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (person.person_id, opp.fingerprint),
+                ).fetchone()
+                if existing:
+                    opp.feedback_token = existing["token"]
+                    continue
+                token = secrets.token_urlsafe(18)
+                conn.execute(
+                    """
+                    INSERT INTO opportunity_feedback
+                    (token, person_id, person_name, fingerprint, url, title,
+                     outlet, opportunity_type, why_relevant, suggested_angle,
+                     verdict, reason, created_at, decided_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', ?, NULL)
+                    """,
+                    (
+                        token,
+                        person.person_id,
+                        person.name,
+                        opp.fingerprint,
+                        opp.url,
+                        opp.title,
+                        opp.outlet,
+                        opp.opportunity_type,
+                        opp.why_relevant,
+                        opp.suggested_angle,
+                        now,
+                    ),
+                )
+                opp.feedback_token = token
+
+    def get_feedback(self, token: str) -> FeedbackRecord | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM opportunity_feedback WHERE token = ?",
+                (token,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _feedback_from_row(row)
+
+    def record_feedback(self, token: str, verdict: str, reason: str = "") -> FeedbackRecord | None:
+        """Save yes/no for this link. A later decision on the same URL wins."""
+        if verdict not in {"yes", "no"}:
+            raise ValueError(f"verdict must be yes or no, got {verdict!r}")
+        current = self.get_feedback(token)
+        if current is None:
+            return None
+        cleaned = reason.strip() if verdict == "no" else ""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE opportunity_feedback
+                SET verdict = ?, reason = ?, decided_at = ?
+                WHERE token = ?
+                """,
+                (verdict, cleaned, now, token),
+            )
+        return self.get_feedback(token)
+
+    def latest_decisions(self) -> dict[str, FeedbackRecord]:
+        """Newest yes/no per URL fingerprint."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM opportunity_feedback
+                WHERE verdict IN ('yes', 'no')
+                ORDER BY decided_at DESC, created_at DESC
+                """
+            ).fetchall()
+        latest: dict[str, FeedbackRecord] = {}
+        for row in rows:
+            record = _feedback_from_row(row)
+            if record.fingerprint and record.fingerprint not in latest:
+                latest[record.fingerprint] = record
+        return latest
+
+    def rejected_fingerprints(self) -> set[str]:
+        return {
+            fp
+            for fp, record in self.latest_decisions().items()
+            if record.verdict == "no"
+        }
+
+    def rejections(self, *, limit: int = 25) -> list[FeedbackRecord]:
+        """Latest 'no' decisions, newest first, for the research prompt."""
+        rejected = [
+            record
+            for record in self.latest_decisions().values()
+            if record.verdict == "no" and record.reason.strip()
+        ]
+        rejected.sort(key=lambda record: record.decided_at or "", reverse=True)
+        return rejected[:limit]
+
+
+def open_store() -> LocalStore:
+    """Local SQLite, or Azure Table Storage when STORAGE_BACKEND=tables."""
+    if settings.storage_backend in {"tables", "table", "azure"}:
+        from pipeline.table_store import TableStore
+
+        return TableStore()  # type: ignore[return-value]
+    return LocalStore()
+
+
+def _feedback_from_row(row: sqlite3.Row) -> FeedbackRecord:
+    return FeedbackRecord(
+        token=row["token"],
+        person_id=row["person_id"],
+        person_name=row["person_name"] or "",
+        fingerprint=row["fingerprint"] or "",
+        url=row["url"] or "",
+        title=row["title"] or "",
+        outlet=row["outlet"] or "",
+        opportunity_type=row["opportunity_type"] or "",
+        why_relevant=row["why_relevant"] or "",
+        suggested_angle=row["suggested_angle"] or "",
+        verdict=row["verdict"] or "",
+        reason=row["reason"] or "",
+        created_at=row["created_at"] or "",
+        decided_at=row["decided_at"] or "",
+    )

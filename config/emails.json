@@ -1,0 +1,17 @@
+{
+  "_comment": "Optional email overlay. Keys are 'Full Name' or 'Firm|Full Name'. The Excel roster has no email column yet — add addresses here for future Graph delivery. Local outbox works without them.",
+  "Bill Poston": "",
+  "Amy Kenly": "",
+  "Lauren Darby": "",
+  "Dan Desko": "",
+  "Marissa Salzone": "",
+  "Steve Dyson": "",
+  "Josh Fleming": "",
+  "Sarah Inman": "",
+  "Vince Jackson": "",
+  "Ben Mohlie": "",
+  "Lindsey Hawkins": "",
+  "Derek Sexter": "",
+  "Dan Keseloff": "",
+  "Paulo Robles": ""
+}

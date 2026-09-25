@@ -1,0 +1,14 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+data/pipeline.db
+outbox/*
+!outbox/.gitkeep
+data/*
+!data/.gitkeep
+ms_auth_keys.txt
+msal_token_cache.bin
+local.settings.json
+.pytest_cache/
+*.egg-info/

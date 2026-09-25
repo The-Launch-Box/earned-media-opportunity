@@ -1,0 +1,11 @@
+anthropic>=0.49.0
+openpyxl>=3.1.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+rich>=13.0.0
+msal>=1.31.0
+httpx>=0.27.0
+azure-functions>=1.21.0
+azure-data-tables>=12.5.0
+azure-storage-blob>=12.24.0
+azure-identity>=1.19.0
