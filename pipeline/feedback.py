@@ -7,10 +7,12 @@ has the button that writes the verdict. 'No' asks why before it saves.
 
 from __future__ import annotations
 
+import base64
 import re
 from dataclasses import dataclass
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from pipeline.storage import FeedbackRecord, LocalStore
@@ -173,35 +175,46 @@ def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
     return parse_form_body(handler.rfile.read(length))
 
 
+_THEME_PATH = Path(__file__).with_name("feedback_theme.css")
+_LOGO_PATH = (
+    Path(__file__).resolve().parent.parent / "assets" / "The Launch Box Logo White (1).png"
+)
+
+
+def _brand_logo() -> str:
+    if not _LOGO_PATH.is_file():
+        return ""
+    encoded = base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
+    return "data:image/png;base64," + encoded
+
+
 def _page(title: str, body: str) -> str:
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{escape(title)}</title>
-<style>
-  body {{ font-family: Georgia, serif; color: #1a1a1a; margin: 0; background: #f6f4ef; }}
-  main {{ max-width: 38rem; margin: 3rem auto; padding: 0 1.25rem 3rem; }}
-  h1 {{ font-size: 1.45rem; line-height: 1.3; }}
-  .card {{ background: #fff; border: 1px solid #e4dfd4; padding: 1rem 1.1rem; }}
-  .meta {{ color: #555; font-size: 0.95rem; }}
-  label {{ display: block; margin: 1rem 0 0.4rem; font-weight: 600; }}
-  textarea {{ width: 100%; min-height: 7rem; font: 1rem/1.4 Georgia, serif; padding: 0.6rem; box-sizing: border-box; }}
-  button, .btn {{ display: inline-block; margin-top: 0.8rem; padding: 0.55rem 1rem; border: 0; cursor: pointer; text-decoration: none; color: #fff; }}
-  .yes {{ background: #0d6b3d; }}
-  .no {{ background: #9b1c1c; }}
-  .error {{ color: #9b1c1c; }}
-  a.quiet {{ color: #333; }}
-</style>
-</head>
-<body>
-<main>
-{body}
-</main>
-</body>
-</html>
-"""
+    """Same chrome as the console: dark Launch Box canvas, wordmark, Manrope."""
+    styles = _THEME_PATH.read_text(encoding="utf-8") if _THEME_PATH.is_file() else ""
+    logo = _brand_logo()
+    mark = (
+        f'<a class="brand" href="/"><img class="logo" src="{logo}" alt="The Launch Box"></a>'
+        if logo
+        else '<a class="brand" href="/">The Launch Box</a>'
+    )
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en" class="dark">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{escape(title)} · Earned media</title>\n"
+        "<style>\n"
+        + styles
+        + "</style>\n</head>\n<body>\n"
+        '<header class="topbar">\n'
+        + mark
+        + '\n<span class="product">Earned media</span>\n'
+        "</header>\n"
+        '<div class="stage">\n<main class="decision">\n'
+        + body
+        + "\n</main>\n</div>\n</body>\n</html>\n"
+    )
 
 
 def _opportunity_card(record: FeedbackRecord) -> str:
