@@ -92,11 +92,13 @@ A quiet day says “No new earned-media opportunities today.” Links already se
 
 ## What to do with each opportunity
 
-Each item asks **Is this a worthwhile opportunity?** with **Yes** and **No**. Opening the link from the email does not save anything, because mail security tools open links on their own. The page has the button that writes your decision.
+Each item asks **Is this a worthwhile opportunity?** with **Yes**, **No**, and **Make it LinkedIn**. Opening the link from the email does not save anything, because mail security tools open links on their own. The page has the button that writes your decision.
 
 **Yes** marks the item as worthwhile. That answer is stored and is not used to filter later searches. You can change it to No from the confirmation page.
 
 **No** opens **Why isn't this worthwhile?** Write a short reason, at least a few words: the outlet, the audience, or why it does not fit this person. Examples the page suggests: pay-to-play, wrong audience, already pitched, too junior. Choose **Save**. The next search reads that reason and avoids opportunities like it. You can change a saved No back to Yes from the confirmation page.
+
+**Make it LinkedIn** opens **Draft a LinkedIn post?** Choose **Email the draft**. That emails a first-person post for the speaker to edit. Nothing is published on LinkedIn, and nothing is sent to the outlet. A draft does not undo a No.
 
 ## When a page says something went wrong
 

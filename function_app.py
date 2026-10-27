@@ -1,4 +1,4 @@
-"""Azure Functions host: morning timer plus the Yes/No pages."""
+"""Azure Functions host: morning timer, LinkedIn drafts, and the feedback pages."""
 
 from __future__ import annotations
 
@@ -32,6 +32,15 @@ def morning_roundup(timer: func.TimerRequest) -> None:
     )
     for item in result.errors:
         logger.error("Research failed for %s: %s", item.person.name, item.error)
+
+
+@app.timer_trigger(schedule="0 * * * * *", arg_name="timer", run_on_startup=False)
+def linkedin_drafts(timer: func.TimerRequest) -> None:
+    """Send LinkedIn drafts queued by Make it LinkedIn. The click only queues."""
+    del timer
+    from pipeline.followup import process_pending_followups
+
+    process_pending_followups()
 
 
 @app.route(

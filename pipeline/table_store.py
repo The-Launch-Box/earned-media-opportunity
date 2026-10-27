@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pipeline.config import settings
 from pipeline.models import Opportunity, SiteMetrics, Spokesperson
-from pipeline.storage import FeedbackRecord
+from pipeline.storage import ActionJob, FeedbackRecord, _stale_cutoff
 
 
 def _q(value: str) -> str:
@@ -48,6 +48,7 @@ class TableStore:
         self._sent = service.create_table_if_not_exists("SentOpportunities")
         self._semrush = service.create_table_if_not_exists("SemrushDomains")
         self._feedback = service.create_table_if_not_exists("OpportunityFeedback")
+        self._actions = service.create_table_if_not_exists("ActionJobs")
 
     def roster_ids(self) -> set[str]:
         return {entity["RowKey"] for entity in self._roster.list_entities()}
@@ -92,6 +93,13 @@ class TableStore:
         people = [_spokesperson(entity) for entity in self._roster.list_entities()]
         people.sort(key=lambda person: (person.firm.casefold(), person.name.casefold()))
         return people
+
+    def get_person(self, person_id: str) -> Spokesperson | None:
+        try:
+            entity = self._roster.get_entity("roster", person_id)
+        except _not_found():
+            return None
+        return _spokesperson(entity)
 
     def already_sent(self, person_id: str, fingerprint: str) -> bool:
         try:
@@ -246,11 +254,13 @@ class TableStore:
     def record_feedback(
         self, token: str, verdict: str, reason: str = ""
     ) -> FeedbackRecord | None:
-        if verdict not in {"yes", "no"}:
-            raise ValueError(f"verdict must be yes or no, got {verdict!r}")
+        if verdict not in {"yes", "no", "linkedin"}:
+            raise ValueError(f"verdict must be yes, no, or linkedin, got {verdict!r}")
         current = self.get_feedback(token)
         if current is None:
             return None
+        if verdict == "linkedin" and current.verdict == "no":
+            return current
         cleaned = reason.strip() if verdict == "no" else ""
         now = datetime.now(timezone.utc).isoformat()
         try:
@@ -298,6 +308,104 @@ class TableStore:
         rejected.sort(key=lambda record: record.decided_at or "", reverse=True)
         return rejected[:limit]
 
+    def enqueue_action(self, token: str, kind: str) -> str:
+        if kind != "linkedin":
+            raise ValueError(f"kind must be linkedin, got {kind!r}")
+        now = datetime.now(timezone.utc).isoformat()
+        cutoff = _stale_cutoff()
+        existing = self._open_action(token, kind)
+        if existing is not None:
+            fresh = _text(existing.get("status")) == "queued" or _text(existing.get("created_at")) >= cutoff
+            if fresh:
+                return _text(existing.get("RowKey"))
+            existing["status"] = "queued"
+            existing["error"] = ""
+            existing["finished_at"] = ""
+            self._actions.update_entity(existing, mode=_replace())
+            return _text(existing.get("RowKey"))
+        job_id = secrets.token_urlsafe(12)
+        self._actions.create_entity(
+            {
+                "PartitionKey": "action",
+                "RowKey": job_id,
+                "token": token,
+                "kind": kind,
+                "status": "queued",
+                "error": "",
+                "created_at": now,
+                "finished_at": "",
+            }
+        )
+        return job_id
+
+    def claim_action(self, job_id: str) -> ActionJob | None:
+        try:
+            entity = dict(self._actions.get_entity("action", job_id))
+        except _not_found():
+            return None
+        status = _text(entity.get("status"))
+        stale = status == "running" and _text(entity.get("created_at")) < _stale_cutoff()
+        if status != "queued" and not stale:
+            return None
+        entity["status"] = "running"
+        self._actions.update_entity(entity, mode=_replace())
+        return _action_from_entity(entity)
+
+    def queued_actions(self) -> list[ActionJob]:
+        cutoff = _stale_cutoff()
+        jobs = [
+            _action_from_entity(entity)
+            for entity in self._actions.list_entities()
+            if _text(entity.get("PartitionKey")) == "action"
+        ]
+        pending = [
+            job
+            for job in jobs
+            if job.status == "queued" or (job.status == "running" and job.created_at < cutoff)
+        ]
+        pending.sort(key=lambda job: job.created_at)
+        return pending
+
+    def finish_action(self, job_id: str, *, status: str, error: str = "") -> None:
+        if status not in {"sent", "error"}:
+            raise ValueError(f"status must be sent or error, got {status!r}")
+        try:
+            entity = dict(self._actions.get_entity("action", job_id))
+        except _not_found():
+            return
+        entity["status"] = status
+        entity["error"] = (error or "")[:2000]
+        entity["finished_at"] = datetime.now(timezone.utc).isoformat()
+        self._actions.update_entity(entity, mode=_replace())
+
+    def latest_action(self, token: str) -> ActionJob | None:
+        matches = [
+            _action_from_entity(entity)
+            for entity in self._actions.query_entities(
+                query_filter=f"PartitionKey eq 'action' and token eq {_q(token)}"
+            )
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda job: job.created_at, reverse=True)
+        return matches[0]
+
+    def _open_action(self, token: str, kind: str):
+        rows = [
+            dict(entity)
+            for entity in self._actions.query_entities(
+                query_filter=(
+                    "PartitionKey eq 'action' "
+                    f"and token eq {_q(token)} and kind eq {_q(kind)}"
+                )
+            )
+            if _text(entity.get("status")) in {"queued", "running"}
+        ]
+        if not rows:
+            return None
+        rows.sort(key=lambda row: _text(row.get("created_at")), reverse=True)
+        return rows[0]
+
     def _pending_feedback(self, person_id: str, fingerprint: str):
         rows = list(
             self._feedback.query_entities(
@@ -339,6 +447,18 @@ def _spokesperson(entity: dict) -> Spokesperson:
         prior_work=_text(entity.get("prior_work")),
         bio=_text(entity.get("bio")),
         email=email or None,
+    )
+
+
+def _action_from_entity(entity: dict) -> ActionJob:
+    return ActionJob(
+        job_id=_text(entity.get("RowKey")),
+        token=_text(entity.get("token")),
+        kind=_text(entity.get("kind")),
+        status=_text(entity.get("status")),
+        error=_text(entity.get("error")),
+        created_at=_text(entity.get("created_at")),
+        finished_at=_text(entity.get("finished_at")),
     )
 
 

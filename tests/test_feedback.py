@@ -76,11 +76,16 @@ def test_roundup_links_only_when_configured() -> None:
     )
     yes = feedback_href(base, opp.feedback_token, "yes")
     no = feedback_href(base, opp.feedback_token, "no")
+    linkedin = feedback_href(base, opp.feedback_token, "linkedin")
     assert "Is this a worthwhile opportunity?" in roundup.body_text
     assert yes in roundup.body_text
+    assert "Make it LinkedIn" in roundup.body_text
+    assert linkedin in roundup.body_text
     assert no in roundup.body_html
+    assert linkedin in roundup.body_html
     assert 'background:#0d6b3d;">Yes</a>' in roundup.body_html
     assert 'background:#9b1c1c;">No</a>' in roundup.body_html
+    assert 'background:#0a66c2;">Make it LinkedIn</a>' in roundup.body_html
 
     quiet = build_roundup(
         [PersonSection(person=person, opportunities=[opp])],
@@ -147,8 +152,84 @@ def _test_get_does_not_save_and_no_requires_a_reason(tmp_path: Path) -> None:
         thread.join(timeout=5)
 
 
+def test_linkedin_click_queues_a_draft_and_does_not_reject() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        _test_linkedin_click_queues_a_draft_and_does_not_reject(Path(tmp))
+
+
+def _test_linkedin_click_queues_a_draft_and_does_not_reject(tmp_path: Path) -> None:
+    import os
+    from unittest.mock import patch
+
+    from pipeline.followup import LinkedInDraft
+
+    store = LocalStore(tmp_path / "pipeline.db")
+    person = _person()
+    opp = _opp()
+    store.issue_feedback(person, [opp])
+    token = opp.feedback_token
+    store.record_feedback(token, "no", "Wrong audience — consumer apps.")
+    assert opp.fingerprint in store.rejected_fingerprints()
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _handler(store))
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    port = httpd.server_address[1]
+    previous = os.environ.get("DASHBOARD_EXECUTION")
+    os.environ["DASHBOARD_EXECUTION"] = "inline"
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/feedback/{token}/linkedin") as response:
+            page = response.read().decode()
+            assert response.status == 200
+        assert "Email the draft" in page
+        assert store.get_feedback(token).verdict == "no"
+
+        draft = LinkedInDraft(post="A first-person note.", note="Personalize the opening.")
+        with patch("pipeline.followup.draft_linkedin", return_value=draft), patch(
+            "pipeline.followup._deliver_followup"
+        ) as deliver:
+            request = Request(
+                f"http://127.0.0.1:{port}/feedback/{token}/linkedin",
+                data=b"",
+                method="POST",
+            )
+            with urlopen(request) as response:
+                saved = response.read().decode()
+                assert response.status == 200
+        assert "LinkedIn draft was sent" in saved
+        assert store.get_feedback(token).verdict == "no"
+        assert opp.fingerprint in store.rejected_fingerprints()
+        deliver.assert_called_once()
+        assert "A first-person note." in deliver.call_args.kwargs["text"]
+
+        fresh = _opp("https://example.com/articles/amy")
+        store.issue_feedback(person, [fresh])
+        fresh_token = fresh.feedback_token
+        with patch("pipeline.followup.draft_linkedin", return_value=draft), patch(
+            "pipeline.followup._deliver_followup"
+        ):
+            request = Request(
+                f"http://127.0.0.1:{port}/feedback/{fresh_token}/linkedin",
+                data=b"",
+                method="POST",
+            )
+            with urlopen(request) as response:
+                saved = response.read().decode()
+        assert "LinkedIn draft was sent" in saved
+        assert store.get_feedback(fresh_token).verdict == "linkedin"
+        assert fresh.fingerprint not in store.rejected_fingerprints()
+    finally:
+        if previous is None:
+            os.environ.pop("DASHBOARD_EXECUTION", None)
+        else:
+            os.environ["DASHBOARD_EXECUTION"] = previous
+        httpd.shutdown()
+        thread.join(timeout=5)
+
+
 if __name__ == "__main__":
     test_rejection_reaches_the_prompt()
     test_roundup_links_only_when_configured()
     test_get_does_not_save_and_no_requires_a_reason()
+    test_linkedin_click_queues_a_draft_and_does_not_reject()
     print("ok")

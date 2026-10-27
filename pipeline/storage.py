@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -68,6 +68,18 @@ CREATE TABLE IF NOT EXISTS opportunity_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_feedback_fingerprint
     ON opportunity_feedback(fingerprint);
+
+CREATE TABLE IF NOT EXISTS action_jobs (
+    job_id      TEXT PRIMARY KEY,
+    token       TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    error       TEXT,
+    created_at  TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_token ON action_jobs(token, created_at);
 """
 
 
@@ -87,6 +99,17 @@ class FeedbackRecord:
     reason: str
     created_at: str
     decided_at: str
+
+
+@dataclass
+class ActionJob:
+    job_id: str
+    token: str
+    kind: str
+    status: str
+    error: str
+    created_at: str
+    finished_at: str
 
 
 class LocalStore:
@@ -203,6 +226,26 @@ class LocalStore:
             )
             for r in rows
         ]
+
+    def get_person(self, person_id: str) -> Spokesperson | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM roster WHERE person_id = ?",
+                (person_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return Spokesperson(
+            person_id=row["person_id"],
+            firm=row["firm"],
+            name=row["name"],
+            title=row["title"] or "",
+            linkedin=row["linkedin"] or "",
+            topics=row["topics"] or "",
+            prior_work=row["prior_work"] or "",
+            bio=row["bio"] or "",
+            email=row["email"],
+        )
 
     def already_sent(self, person_id: str, fingerprint: str) -> bool:
         with self._conn() as conn:
@@ -399,12 +442,18 @@ class LocalStore:
         return _feedback_from_row(row)
 
     def record_feedback(self, token: str, verdict: str, reason: str = "") -> FeedbackRecord | None:
-        """Save yes/no for this link. A later decision on the same URL wins."""
-        if verdict not in {"yes", "no"}:
-            raise ValueError(f"verdict must be yes or no, got {verdict!r}")
+        """Save yes/no for this link. A later decision on the same URL wins.
+
+        Make it LinkedIn does not erase a No. A post draft is not a decision
+        to start suggesting that kind of opportunity again.
+        """
+        if verdict not in {"yes", "no", "linkedin"}:
+            raise ValueError(f"verdict must be yes, no, or linkedin, got {verdict!r}")
         current = self.get_feedback(token)
         if current is None:
             return None
+        if verdict == "linkedin" and current.verdict == "no":
+            return current
         cleaned = reason.strip() if verdict == "no" else ""
         now = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
@@ -452,6 +501,113 @@ class LocalStore:
         rejected.sort(key=lambda record: record.decided_at or "", reverse=True)
         return rejected[:limit]
 
+    def enqueue_action(self, token: str, kind: str) -> str:
+        if kind != "linkedin":
+            raise ValueError(f"kind must be linkedin, got {kind!r}")
+        now = datetime.now(timezone.utc).isoformat()
+        cutoff = _stale_cutoff()
+        with self._conn() as conn:
+            existing = conn.execute(
+                """
+                SELECT job_id, status, created_at FROM action_jobs
+                WHERE token = ? AND kind = ? AND status IN ('queued', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (token, kind),
+            ).fetchone()
+            if existing:
+                fresh = existing["status"] == "queued" or (existing["created_at"] or "") >= cutoff
+                if fresh:
+                    return existing["job_id"]
+                conn.execute(
+                    """
+                    UPDATE action_jobs
+                    SET status = 'queued', error = '', finished_at = NULL
+                    WHERE job_id = ?
+                    """,
+                    (existing["job_id"],),
+                )
+                return existing["job_id"]
+            job_id = secrets.token_urlsafe(12)
+            conn.execute(
+                """
+                INSERT INTO action_jobs
+                (job_id, token, kind, status, error, created_at, finished_at)
+                VALUES (?, ?, ?, 'queued', '', ?, NULL)
+                """,
+                (job_id, token, kind, now),
+            )
+        return job_id
+
+    def claim_action(self, job_id: str) -> ActionJob | None:
+        cutoff = _stale_cutoff()
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE action_jobs
+                SET status = 'running'
+                WHERE job_id = ?
+                  AND (
+                    status = 'queued'
+                    OR (status = 'running' AND created_at < ?)
+                  )
+                """,
+                (job_id, cutoff),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = conn.execute(
+                "SELECT * FROM action_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _action_from_row(row)
+
+    def queued_actions(self) -> list[ActionJob]:
+        cutoff = _stale_cutoff()
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM action_jobs
+                WHERE status = 'queued'
+                   OR (status = 'running' AND created_at < ?)
+                ORDER BY created_at
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [_action_from_row(row) for row in rows]
+
+    def finish_action(self, job_id: str, *, status: str, error: str = "") -> None:
+        if status not in {"sent", "error"}:
+            raise ValueError(f"status must be sent or error, got {status!r}")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE action_jobs
+                SET status = ?, error = ?, finished_at = ?
+                WHERE job_id = ?
+                """,
+                (status, (error or "")[:2000], now, job_id),
+            )
+
+    def latest_action(self, token: str) -> ActionJob | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM action_jobs
+                WHERE token = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (token,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _action_from_row(row)
+
 
 def open_store() -> LocalStore:
     """Local SQLite, or Azure Table Storage when STORAGE_BACKEND=tables."""
@@ -478,4 +634,23 @@ def _feedback_from_row(row: sqlite3.Row) -> FeedbackRecord:
         reason=row["reason"] or "",
         created_at=row["created_at"] or "",
         decided_at=row["decided_at"] or "",
+    )
+
+
+_STALE_AFTER = timedelta(minutes=30)
+
+
+def _stale_cutoff() -> str:
+    return (datetime.now(timezone.utc) - _STALE_AFTER).isoformat()
+
+
+def _action_from_row(row: sqlite3.Row) -> ActionJob:
+    return ActionJob(
+        job_id=row["job_id"],
+        token=row["token"],
+        kind=row["kind"],
+        status=row["status"] or "",
+        error=row["error"] or "",
+        created_at=row["created_at"] or "",
+        finished_at=row["finished_at"] or "",
     )

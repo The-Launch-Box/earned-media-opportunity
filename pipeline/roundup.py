@@ -175,10 +175,12 @@ def _feedback_text(opp: Opportunity, feedback_base: str) -> list[str]:
         return []
     yes = feedback_href(feedback_base, opp.feedback_token, "yes")
     no = feedback_href(feedback_base, opp.feedback_token, "no")
+    linkedin = feedback_href(feedback_base, opp.feedback_token, "linkedin")
     return [
         "  Is this a worthwhile opportunity?",
         f"  Yes: {yes}",
         f"  No: {no}",
+        f"  Make it LinkedIn: {linkedin}",
     ]
 
 
@@ -271,8 +273,9 @@ def _feedback_html(opp: Opportunity, feedback_base: str) -> str:
         return ""
     yes = escape(feedback_href(feedback_base, opp.feedback_token, "yes"))
     no = escape(feedback_href(feedback_base, opp.feedback_token, "no"))
+    linkedin = escape(feedback_href(feedback_base, opp.feedback_token, "linkedin"))
     button = (
-        "display:inline-block;padding:6px 14px;color:#ffffff;"
+        "display:inline-block;padding:6px 12px;color:#ffffff;"
         "text-decoration:none;border-radius:4px;font-family:Georgia,serif;"
     )
     return (
@@ -282,8 +285,11 @@ def _feedback_html(opp: Opportunity, feedback_base: str) -> str:
         "<tr>"
         '<td style="padding-right:8px;">'
         f'<a href="{yes}" style="{button}background:#0d6b3d;">Yes</a>'
-        "</td><td>"
+        "</td>"
+        '<td style="padding-right:8px;">'
         f'<a href="{no}" style="{button}background:#9b1c1c;">No</a>'
+        "</td><td>"
+        f'<a href="{linkedin}" style="{button}background:#0a66c2;">Make it LinkedIn</a>'
         "</td></tr></table>"
     )
 
