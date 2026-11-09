@@ -125,16 +125,69 @@ def _send_url() -> str:
     return f"https://graph.microsoft.com/v1.0/users/{mailbox}/sendMail"
 
 
-def send_roundup_email(*, subject: str, html_body: str) -> None:
-    to_addr = settings.blast_to.strip()
-    if not to_addr:
+class InboxUnavailable(RuntimeError):
+    """The sending mailbox cannot be read yet. Button declines still work."""
+
+
+def list_recent_inbox(*, top: int = 25) -> list[dict]:
+    """Recent inbox messages, newest first. Requires Mail.Read."""
+    if not settings.azure_tenant_id or not settings.azure_client_id:
+        raise InboxUnavailable("Graph is not configured, so reply declines are not read.")
+    if _application_auth() and not settings.mail_from.strip():
+        raise InboxUnavailable("MAIL_FROM is empty, so reply declines are not read.")
+    token = acquire_graph_token(interactive=False)
+    if _application_auth():
+        base = (
+            "https://graph.microsoft.com/v1.0/users/"
+            f"{quote(settings.mail_from.strip())}"
+        )
+    else:
+        base = "https://graph.microsoft.com/v1.0/me"
+    url = (
+        f"{base}/mailFolders/inbox/messages"
+        f"?$top={int(top)}&$select=id,subject,body,receivedDateTime"
+        "&$orderby=receivedDateTime desc"
+    )
+    response = httpx.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60.0,
+    )
+    if response.status_code in {401, 403}:
+        raise InboxUnavailable(
+            "Inbox replies need Mail.Read on the Graph app. "
+            "No-Go on the page still saves the reason."
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Graph inbox read failed ({response.status_code}): {response.text[:400]}"
+        )
+    payload = response.json()
+    messages = payload.get("value")
+    if not isinstance(messages, list):
+        return []
+    return [item for item in messages if isinstance(item, dict)]
+
+
+def send_roundup_email(
+    *,
+    subject: str,
+    html_body: str,
+    to_addrs: list[str] | None = None,
+) -> None:
+    recipients = [item.strip() for item in (to_addrs or []) if item.strip()]
+    if not recipients:
+        fallback = settings.blast_to.strip()
+        if fallback:
+            recipients = [fallback]
+    if not recipients:
         raise RuntimeError("BLAST_TO is empty. Set it in .env (Amy's address).")
 
     token = acquire_graph_token(interactive=not _application_auth())
     message: dict = {
         "subject": subject,
         "body": {"contentType": "HTML", "content": html_body},
-        "toRecipients": [{"emailAddress": {"address": to_addr}}],
+        "toRecipients": [{"emailAddress": {"address": addr}} for addr in recipients],
     }
     payload = {"message": message, "saveToSentItems": True}
 

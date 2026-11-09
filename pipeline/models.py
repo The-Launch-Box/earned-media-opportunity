@@ -121,6 +121,37 @@ class SiteMetrics(BaseModel):
         return f"Site: {self.visits_display()} · {self.legitimacy_display()}"
 
 
+class PodcastAudience(BaseModel):
+    """Spotify catalog match, plus a Rephonic listener estimate when one exists."""
+
+    query: str = ""
+    show_name: str = ""
+    spotify_id: str = ""
+    spotify_url: str = ""
+    publisher: str = ""
+    on_spotify: bool = False
+    est_weekly_downloads: int | None = None
+    downloads_per_episode: int | None = None
+    spotify_followers: int | None = None
+    fetched_at: str = ""
+    error: str = ""
+    source: str = ""  # live | cache | stub
+
+    def summary_line(self) -> str:
+        """Roundup line. Empty when the show is not on Spotify."""
+        if not self.on_spotify:
+            return ""
+        name = f" ({self.show_name})" if self.show_name else ""
+        if self.est_weekly_downloads is not None:
+            count = format_count(self.est_weekly_downloads)
+            return f"Listeners: ~{count} estimated weekly downloads{name}"
+        if self.spotify_followers is not None:
+            count = format_count(self.spotify_followers)
+            return f"Listeners: ~{count} Spotify followers{name}"
+        label = self.show_name or "this show"
+        return f"Spotify: {label}"
+
+
 def format_count(n: int) -> str:
     """Compact human count: 1490 → 1.5K, 1_200_000 → 1.2M."""
     abs_n = abs(n)
@@ -149,8 +180,12 @@ class Opportunity(BaseModel):
     urgent: bool = False
     fingerprint: str = ""
     site: SiteMetrics | None = None
-    # Local-only link token for the Yes/No line in the roundup. Not from Claude.
+    podcast: PodcastAudience | None = None
+    # Local-only link token for the action buttons in the roundup. Not from Claude.
     feedback_token: str = ""
+    # Set when the roundup is built. item_number is 1-based within that email.
+    item_number: int = 0
+    batch_key: str = ""
 
     @model_validator(mode="after")
     def ensure_fingerprint(self) -> Opportunity:
@@ -189,6 +224,10 @@ class ResearchResult(BaseModel):
     opportunities: list[Opportunity]
     raw_summary: str = ""
     search_count: int = 0
+    model_name: str = ""
+    provider: str = ""  # claude | foundry | dry-run
+    claude_credit_code: str = ""
+    claude_credit_http_status: int | None = None
     searched_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -205,3 +244,5 @@ class Roundup(BaseModel):
     new_people: list[str] = Field(default_factory=list)
     urgent_count: int = 0
     generated_on: str = Field(default_factory=lambda: date.today().isoformat())
+    # Short id for this email, so a reply can point at item 1, 2, 3…
+    batch_key: str = ""

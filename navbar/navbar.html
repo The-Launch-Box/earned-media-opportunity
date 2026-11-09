@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TLB navbar</title>
+    <link rel="stylesheet" href="navbar.css" />
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #0d1117;
+        color: #f0f6fc;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      Drop this folder into the other app and keep the files together:
+        navbar.css
+        tlb-arrow.png          (the mark the portal header uses)
+        arrow.svg               (same mark, as a vector)
+        fonts/BebasNeuePro-BoldItalic.otf
+
+      The wordmark and the back arrow both go to https://os.thelaunchbox.com.
+      Put your own controls inside tlb-navbar__actions.
+      Add class tlb-navbar--light on the header for the light bar.
+    -->
+    <header class="tlb-navbar">
+      <div class="tlb-navbar__row">
+        <a
+          class="tlb-navbar__brand"
+          href="https://os.thelaunchbox.com"
+          title="The Launch Box OS"
+        >
+          <img class="tlb-navbar__mark" src="tlb-arrow.png" alt="The Launch Box" />
+          <span class="tlb-navbar__word">ACCELERATED BY THE LAUNCH BOX</span>
+        </a>
+
+        <span class="tlb-navbar__section">
+          <span class="tlb-navbar__rule" aria-hidden="true"></span>
+          <span class="tlb-navbar__crumb">
+            <a
+              class="tlb-navbar__back"
+              href="https://os.thelaunchbox.com"
+              aria-label="Back to The Launch Box OS"
+              title="Back to The Launch Box OS"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="m12 19-7-7 7-7" />
+                <path d="M19 12H5" />
+              </svg>
+            </a>
+            <span class="tlb-navbar__section-label">Finance</span>
+          </span>
+        </span>
+
+        <div class="tlb-navbar__actions"></div>
+      </div>
+    </header>
+  </body>
+</html>

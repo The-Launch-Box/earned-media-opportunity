@@ -1,4 +1,4 @@
-"""Azure Functions host: morning timer, LinkedIn drafts, and the feedback pages."""
+"""Azure Functions host: morning Excel job, per-company schedules, and the dashboard."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ import logging
 
 import azure.functions as func
 
-from pipeline.feedback import handle_feedback_request, parse_form_body
-from pipeline.storage import open_store
+from pipeline.dashboard import handle_request
 
 app = func.FunctionApp()
 logger = logging.getLogger("earned-media")
@@ -34,27 +33,40 @@ def morning_roundup(timer: func.TimerRequest) -> None:
         logger.error("Research failed for %s: %s", item.person.name, item.error)
 
 
-@app.timer_trigger(schedule="0 * * * * *", arg_name="timer", run_on_startup=False)
-def linkedin_drafts(timer: func.TimerRequest) -> None:
-    """Send LinkedIn drafts queued by Make it LinkedIn. The click only queues."""
-    del timer
-    from pipeline.followup import process_pending_followups
+@app.timer_trigger(schedule="0 */1 * * * *", arg_name="timer", run_on_startup=False)
+def portco_schedules(timer: func.TimerRequest) -> None:
+    """Start queued dashboard runs and any company whose saved cadence is due."""
+    if timer.past_due:
+        logger.warning("Portfolio schedule timer is past due")
+    from pipeline.jobs import dispatch_due
 
-    process_pending_followups()
+    started = dispatch_due()
+    if started:
+        logger.info("Portfolio runs started: %s", ", ".join(started))
+    try:
+        from pipeline.followup import process_pending_followups
+
+        process_pending_followups()
+    except Exception:
+        logger.exception("Follow-up processing failed")
 
 
-@app.route(
-    route="feedback/{token}/{action}",
-    methods=["GET", "POST"],
-    auth_level=func.AuthLevel.ANONYMOUS,
-)
-def feedback_page(req: func.HttpRequest) -> func.HttpResponse:
-    form = parse_form_body(req.get_body()) if req.method.upper() == "POST" else None
-    result = handle_feedback_request(open_store(), req.method, req.url, form)
-    headers = {"Location": result.location} if result.location else {}
+@app.route(route="{*path}", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def site(req: func.HttpRequest) -> func.HttpResponse:
+    return _site(req)
+
+
+@app.route(route="/", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def site_root(req: func.HttpRequest) -> func.HttpResponse:
+    return _site(req)
+
+
+def _site(req: func.HttpRequest) -> func.HttpResponse:
+    headers = {key: value for key, value in req.headers.items()}
+    result = handle_request(req.method, req.url, headers, req.get_body() or b"")
     return func.HttpResponse(
         result.body or None,
         status_code=result.status,
-        headers=headers,
+        headers={key: value for key, value in result.headers},
         mimetype="text/html",
     )

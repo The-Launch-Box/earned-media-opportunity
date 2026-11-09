@@ -24,8 +24,22 @@ class DeliveryResult:
     reason: str = ""
 
 
-def deliver(roundup: Roundup) -> DeliveryResult:
-    mode = settings.delivery_mode.strip().lower()
+def deliver(
+    roundup: Roundup,
+    *,
+    blast_to: str | None = None,
+    outbox_dir: Path | None = None,
+    delivery_mode: str | None = None,
+    file_slug: str = "",
+) -> DeliveryResult:
+    """Send one roundup.
+
+    `blast_to=None` uses the global BLAST_TO. A company run passes its own
+    recipient, including an empty string, so it never falls back to another
+    company's address.
+    """
+    mode = (delivery_mode if delivery_mode is not None else settings.delivery_mode).strip().lower()
+    to_line = settings.blast_to if blast_to is None else blast_to.strip()
 
     if mode == "none":
         return DeliveryResult(
@@ -37,15 +51,33 @@ def deliver(roundup: Roundup) -> DeliveryResult:
         print(roundup.body_text)
         return DeliveryResult(mode=mode, path=None)
 
-    text_path = _write_outbox(roundup)
+    text_path = _write_outbox(
+        roundup,
+        to_line=to_line,
+        outbox_dir=outbox_dir,
+        file_slug=file_slug,
+    )
 
     if mode != "graph":
         return DeliveryResult(mode="outbox", path=text_path)
 
+    recipients = _split_recipients(to_line)
+    if not recipients:
+        return DeliveryResult(
+            mode="graph",
+            path=text_path,
+            mailed=False,
+            reason="No recipient",
+        )
+
     try:
         from pipeline.graph_mail import send_roundup_email
 
-        send_roundup_email(subject=roundup.subject, html_body=roundup.body_html)
+        send_roundup_email(
+            subject=roundup.subject,
+            html_body=roundup.body_html,
+            to_addrs=recipients,
+        )
     except Exception as exc:  # noqa: BLE001 — surface Graph errors without crashing research
         console.print(f"  [red]Graph send failed:[/] {exc}")
         return DeliveryResult(
@@ -56,21 +88,33 @@ def deliver(roundup: Roundup) -> DeliveryResult:
         )
 
     console.print(
-        f"  [green]sent[/] {settings.mail_from} → {settings.blast_to}"
+        f"  [green]sent[/] {settings.mail_from} → {', '.join(recipients)}"
     )
     return DeliveryResult(mode="graph", path=text_path, mailed=True)
 
 
-def _write_outbox(roundup: Roundup) -> Path:
-    settings.outbox_dir.mkdir(parents=True, exist_ok=True)
+def _split_recipients(raw: str) -> list[str]:
+    return [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
+
+
+def _write_outbox(
+    roundup: Roundup,
+    *,
+    to_line: str,
+    outbox_dir: Path | None = None,
+    file_slug: str = "",
+) -> Path:
+    directory = outbox_dir or settings.outbox_dir
+    directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    base = settings.outbox_dir / f"{stamp}_EMO-Roundup"
+    slug = f"_{file_slug}" if file_slug else ""
+    base = directory / f"{stamp}{slug}_EMO-Roundup"
 
     text_path = Path(str(base) + ".txt")
     html_path = Path(str(base) + ".html")
     meta_path = Path(str(base) + ".json")
 
-    to_line = settings.blast_to or "(no blast recipient — local outbox only)"
+    to_line = to_line or "(no blast recipient — local outbox only)"
     from_line = settings.mail_from or settings.from_name
     header = (
         f"To: {to_line}\n"
@@ -86,7 +130,7 @@ def _write_outbox(roundup: Roundup) -> Path:
     meta_path.write_text(
         json.dumps(
             {
-                "to": settings.blast_to or None,
+                "to": None if to_line.startswith("(no blast recipient") else to_line,
                 "from": settings.mail_from or None,
                 "subject": roundup.subject,
                 "people": [
@@ -111,6 +155,15 @@ def _write_outbox(roundup: Roundup) -> Path:
                     if o.site
                 ],
                 "generated_on": roundup.generated_on,
+                "batch_key": roundup.batch_key,
+                "items": [
+                    {
+                        "number": opp.item_number,
+                        "title": opp.title,
+                        "fingerprint": opp.fingerprint,
+                    }
+                    for opp in roundup.opportunities
+                ],
             },
             indent=2,
         ),

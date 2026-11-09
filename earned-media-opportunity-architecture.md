@@ -45,7 +45,11 @@ The research job itself is still once a day. The one always-on piece is the smal
            │ new items only
            ▼
 ┌─────────────────────┐
-│ Semrush site score  │  visits + Authority Score
+│ Radar site traffic  │  DNS rank for the outlet domain
+└──────────┬──────────┘
+           ▼
+┌─────────────────────┐
+│ Spotify audience    │  podcast subscribers / listeners
 └──────────┬──────────┘
            │
            ▼
@@ -69,9 +73,9 @@ A single `run` invocation:
 
 1. Reloads the SME workbook into SQLite and flags anyone new on the list
 2. Optionally filters by firm, person name, or limit
-3. Researches each person (live Claude, or stubs with `--dry-run`)
+3. Researches each person (live Claude, Azure AI Foundry when Claude credits are exhausted, or stubs with `--dry-run`)
 4. Drops opportunities whose URL fingerprint was already filed for that person
-5. Scores remaining outlet domains via Semrush (monthly visits + Authority Score / legitimacy)
+5. Scores remaining outlet domains via Cloudflare Radar (traffic rank). Podcast items also get Spotify subscribers and monthly listeners when the show object includes them
 6. Builds one team blast: Time-Sensitive, then Other, grouped by person (new roster names appended last)
 7. Writes delivery artifacts under `outbox/`
 8. Records newly sent fingerprints so the next run skips them
@@ -88,11 +92,13 @@ When testing we can host this as a Linux cron job (run every 24 hours ~7 AM), bu
 | Roster ingest | `pipeline/roster.py` | Parse SME Excel; merge optional email overlay |
 | Persistence | `pipeline/storage.py` | SQLite stand-in for Azure Table Storage |
 | Research | `pipeline/research.py` | Claude Messages API + web search tool, or deterministic stubs |
-| Outlet scoring | `pipeline/semrush.py` | Semrush visits, Authority Score, and High/Medium/Low legitimacy |
+| Research fallback | `pipeline/fallback.py` | Azure AI Foundry web search when Claude credits are exhausted |
+| Site traffic | `pipeline/radar.py` | Cloudflare Radar domain rank (DNS to 1.1.1.1) |
+| Podcast audience | `pipeline/spotify.py` | Spotify subscribers, monthly listeners, episode count |
 | Roundup copy | `pipeline/roundup.py` | Subject + plain-text + HTML bodies |
 | Delivery | `pipeline/emailer.py` | Write outbox files (or stdout / none) |
-| Orchestration | `pipeline/runner.py` | Sync → research → dedupe → Semrush → roundup → deliver → record |
-| CLI | `pipeline/__main__.py` | `sync`, `roster`, `run`, `auth`, `sent`, `site`, `serve`, `feedback` |
+| Orchestration | `pipeline/runner.py` | Sync → research → dedupe → Radar → Spotify → roundup → deliver → record |
+| CLI | `pipeline/__main__.py` | `sync`, `roster`, `run`, `auth`, `sent`, `site`, `radar`, `podcast`, `serve`, `feedback` |
 | Feedback | `pipeline/feedback.py` | Yes/No pages and the rejection text added to research prompts |
 
 ## Local stand-ins for the cloud design
@@ -126,7 +132,9 @@ Emails are not yet in the spreadsheet but are being added as testing progresses.
 
 **`sent_opportunities`** — primary key `(person_id, fingerprint)`; stores URL, title, outlet, and `sent_at` so a previously sent opportunity is not included again for that person.
 
-**`semrush_domains`** — one cached Semrush snapshot per root domain (`payload` JSON + `fetched_at`). Fresh for `SEMRUSH_CACHE_DAYS` (default 7) so repeat outlets do not spend API units every morning.
+**`radar_domains`** — one cached Cloudflare Radar ranking per root domain. Fresh for `RADAR_CACHE_DAYS` (default 7).
+
+**`podcast_lookups`** — one cached Spotify search or show lookup. Fresh for `PODCAST_CACHE_DAYS` (default 7). Misses are cached too, so a show that is not on Spotify is not searched again every morning.
 
 **`opportunity_feedback`** — one row per Yes/No link (`token`). Stores the opportunity plus `verdict` (`yes` or `no`) and the reason given for a no. The latest decision for a URL is what later runs honor.
 
@@ -142,7 +150,9 @@ Opportunity types: `press`, `podcast`, `speaking`, `backlink`, `journalist_query
 
 The roundup is one team blast matching [Example_e-mail_blast.md](./Example_e-mail_blast.md): subject dated to today, a **Time-Sensitive** list (deadlines of about 48 hours or less, including “24 hours to respond”), then **Other**. Each list is grouped by spokesperson name. Anyone newly added to `TLB PortCo SME List.xlsx` is researched automatically and appended after existing names. Empty days get a “nothing new” note unless `--skip-empty` is used.
 
-Each opportunity includes a **Site** line when Semrush data is available: estimated monthly visits (Traffic Analytics when the key has access, otherwise organic-search visits) and a legitimacy label derived from Authority Score (High = 50+, Medium = 30–49, Low = below 30, or not in the Semrush index). A missing `SEMRUSH_API_KEY` does not block the blast.
+Each opportunity includes a **Site** line when `CLOUDFLARE_API_TOKEN` is set. Cloudflare Radar ranks the outlet’s own domain from DNS queries to 1.1.1.1: exact global rank for the top 100, a bucket such as top 10K otherwise, or outside the top 1M. That is a traffic-popularity rank, not an estimated visit count. Platform hosts (Spotify, YouTube, Apple, and similar) are skipped. A missing token omits the line and does not block the blast.
+
+A **Podcast** line is added for `podcast` opportunities that are on Spotify: subscribers (the follower total) and monthly listeners when the show object includes them, plus the show name, episode count, publisher, and newest episode date. The public Spotify Web API usually omits both audience counts. A match requires a Spotify show/episode URL, or an outlet name that matches a Spotify show after light normalization. Other opportunity types are not looked up.
 
 When `FEEDBACK_PUBLIC_URL` is set, each item also asks **Is this a worthwhile opportunity?** with Yes and No links. Those links open pages on `python -m pipeline serve`. No asks why before saving. The reason is stored in `opportunity_feedback` and included in the next research prompt so Claude avoids opportunities like that one. Yes is recorded and does not filter later searches. A missing URL omits the links; the rest of the blast still sends. Mail clients cannot run a form inside the message, so the email buttons are links and the save happens on the page (a GET does not write, because link scanners prefetch mail URLs).
 
@@ -164,13 +174,15 @@ Delivery modes (`DELIVERY_MODE`):
 | `python -m pipeline run --firm … / --person … / --limit N` | Testing: subset of the roster |
 | `python -m pipeline auth` | Microsoft device-code login (cached for Graph send) |
 | `python -m pipeline sent [--dump]` | Inspect sent-fingerprint store |
-| `python -m pipeline site <domain-or-url>` | Semrush visits + legitimacy for one outlet |
+| `python -m pipeline site <domain-or-url>` | Cloudflare Radar site traffic for one outlet |
+| `python -m pipeline radar <domain-or-url>` | Same Radar lookup as `site` |
+| `python -m pipeline podcast <name-or-spotify-url>` | Spotify subscribers and monthly listeners for one podcast |
 | `python -m pipeline serve` | Leave the Yes/No pages running |
 | `python -m pipeline feedback` | Show saved worthwhile and rejected decisions |
 
 ## Configuration
 
-Environment (see `.env.example`): Anthropic key and model, web-search tool type and max uses, delivery mode, from-name, optional blast recipient, optional forced dry-run research, Semrush API key (optional but required for visit/legitimacy lines).
+Environment (see `.env.example`): Anthropic key and model, web-search tool type and max uses, delivery mode, from-name, optional blast recipient, optional forced dry-run research, Cloudflare Radar token (optional, for the Site line), Spotify client id and secret (optional, for podcast audience lines).
 
 Paths are fixed relative to the repo root unless code is pointed elsewhere: SME workbook, email overlay, SQLite file, outbox directory.
 

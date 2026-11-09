@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from rich.console import Console
@@ -115,39 +116,144 @@ def cmd_sent(args: argparse.Namespace) -> int:
 
 def cmd_serve(_args: argparse.Namespace) -> int:
     from pipeline.config import settings
-    from pipeline.feedback import serve_feedback
+    from pipeline.dashboard import serve_site
+    from pipeline.ms_login import microsoft_configured
 
-    store = open_store()
     host = settings.feedback_bind
     port = settings.feedback_port
     local_url = f"http://{host}:{port}"
     public = settings.feedback_public_url or local_url
-    console.print(f"Feedback pages: {public}")
-    console.print("Leave this running so Yes/No links in the roundup can be opened.")
+    console.print(f"Dashboard: {local_url}")
+    console.print(f"Go / No-Go / LinkedIn links use: {public}")
+    if microsoft_configured():
+        console.print("[green]Microsoft sign-in is configured.[/]")
+    else:
+        console.print(
+            "[yellow]Microsoft sign-in is not configured.[/] "
+            "Set DASHBOARD_CLIENT_ID and DASHBOARD_CLIENT_SECRET."
+        )
+    if os.getenv("DASHBOARD_DEV_LOGIN", "").strip().lower() in {"1", "true", "yes"}:
+        console.print(
+            "[yellow]Developer sign-in is on.[/] "
+            "Turn off DASHBOARD_DEV_LOGIN before sharing this site."
+        )
     if not settings.feedback_public_url:
         console.print(
             "[yellow]Set FEEDBACK_PUBLIC_URL="
-            f"{local_url} in .env so the morning email includes the links.[/]"
+            f"{local_url} in .env so the roundup email includes the action buttons.[/]"
         )
-    elif settings.feedback_public_url.rstrip("/") != local_url.rstrip("/"):
+    serve_site(host, port)
+    return 0
+
+
+def cmd_tenants(_args: argparse.Namespace) -> int:
+    from pipeline.registry import default_registry
+
+    registry = default_registry()
+    for tenant in registry.list_tenants():
+        console.print(f"[bold]{tenant.name}[/] ({', '.join(tenant.domains)})")
+        where = tenant.storage_account or tenant.db_path or "not created yet"
+        console.print(f"  database: {tenant.storage_backend or '—'} {where}")
         console.print(
-            f"[dim]Listening on {local_url}. "
-            "FEEDBACK_PUBLIC_URL is what the email links use.[/]"
+            f"  schedule: {tenant.cadence or 'manual'}  next: {tenant.next_run_at or '—'}"
         )
-    serve_feedback(store, host, port)
+        console.print(f"  recipients: {tenant.blast_to or '—'}")
+        console.print(f"  Microsoft tenant: {tenant.entra_tenant_id or 'not bound yet'}")
+        if tenant.provision_error:
+            console.print(f"  [red]{tenant.provision_error}[/]")
     return 0
 
 
 def cmd_feedback(_args: argparse.Namespace) -> int:
     store = open_store()
     decisions = list(store.latest_decisions().values())
-    yeses = [row for row in decisions if row.verdict == "yes"]
+    goes = [row for row in decisions if row.verdict == "go"]
     nos = [row for row in decisions if row.verdict == "no"]
-    console.print(f"{len(yeses)} worthwhile · {len(nos)} rejected")
+    console.print(f"{len(goes)} go · {len(nos)} no-go")
     for record in store.rejections(limit=50):
-        console.print(f"[red]no[/] {record.person_name}: {record.title}")
+        number = f"{record.item_number}. " if record.item_number else ""
+        console.print(f"[red]no-go[/] {number}{record.person_name}: {record.title}")
         console.print(f"  {record.reason}")
     return 0
+
+
+def cmd_replies(args: argparse.Namespace) -> int:
+    """Save numbered decline lines from a file, or from the sending mailbox."""
+    from pipeline.decisions import apply_decline_reply
+    from pipeline.followup import _open_stores, ingest_inbox
+
+    stores = list(_open_stores())
+    if not stores:
+        stores = [open_store()]
+    if args.file:
+        text = open(args.file, encoding="utf-8").read()
+        subject, _, body = text.partition("\n")
+        if subject.lower().startswith("subject:"):
+            subject = subject.split(":", 1)[1].strip()
+            body = body.lstrip("\n")
+        else:
+            body = text
+            subject = ""
+        saved = []
+        for store in stores:
+            saved.extend(apply_decline_reply(store, subject, body))
+        console.print(f"Saved {len(saved)} no-go reason(s) from {args.file}.")
+        for record in saved:
+            console.print(f"  {record.item_number}. {record.title}: {record.reason}")
+        return 0 if saved else 1
+    count = ingest_inbox(stores)
+    console.print(f"Saved {count} no-go reason(s) from the inbox.")
+    return 0
+
+
+def cmd_podcast(args: argparse.Namespace) -> int:
+    from pipeline.config import settings
+    from pipeline.podcasts import PodcastClient
+
+    if not args.dry_run and not (
+        settings.spotify_client_id and settings.spotify_client_secret
+    ):
+        console.print(
+            "[red]SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET are missing from .env. "
+            "Pass --dry-run to print a stub listener estimate.[/]"
+        )
+        return 1
+
+    client = PodcastClient(store=open_store(), dry_run=args.dry_run)
+    try:
+        audience = client.lookup_query(args.query)
+    finally:
+        client.close()
+
+    table = Table(title=f"Podcast · {args.query}")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("On Spotify", "yes" if audience.on_spotify else "no")
+    table.add_row("Show", audience.show_name or "—")
+    table.add_row("Spotify URL", audience.spotify_url or "—")
+    weekly = (
+        f"~{audience.est_weekly_downloads:,}"
+        if audience.est_weekly_downloads is not None
+        else "—"
+    )
+    followers = (
+        f"~{audience.spotify_followers:,}"
+        if audience.spotify_followers is not None
+        else "—"
+    )
+    table.add_row("Estimated weekly downloads", weekly)
+    table.add_row("Spotify followers", followers)
+    table.add_row("Roundup line", audience.summary_line() or "—")
+    table.add_row("Source", audience.source or "—")
+    if audience.error:
+        table.add_row("Error", audience.error)
+    if not args.dry_run and not settings.rephonic_api_key:
+        table.add_row(
+            "Note",
+            "REPHONIC_API_KEY is unset, so listener estimates are omitted",
+        )
+    console.print(table)
+    return 0 if audience.on_spotify or args.dry_run else 1
 
 
 def cmd_site(args: argparse.Namespace) -> int:
@@ -258,15 +364,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_serve = sub.add_parser(
         "serve",
-        help="Run the Yes/No feedback pages (leave this running)",
+        help="Run the portco dashboard and the action pages",
     )
     p_serve.set_defaults(func=cmd_serve)
 
+    p_tenants = sub.add_parser(
+        "tenants",
+        help="Show each portfolio company's database and schedule",
+    )
+    p_tenants.set_defaults(func=cmd_tenants)
+
     p_feedback = sub.add_parser(
         "feedback",
-        help="Show saved worthwhile / rejected opportunity decisions",
+        help="Show saved go / no-go decisions",
     )
     p_feedback.set_defaults(func=cmd_feedback)
+
+    p_replies = sub.add_parser(
+        "replies",
+        help="Save no-go lines from a reply file, or from the sending mailbox",
+    )
+    p_replies.add_argument(
+        "--file",
+        help="A saved reply. First line may be 'Subject: ...'. Body lines are '2. reason'.",
+    )
+    p_replies.set_defaults(func=cmd_replies)
+
+    p_podcast = sub.add_parser(
+        "podcast",
+        help="See whether a show is on Spotify and what its listener estimate is",
+    )
+    p_podcast.add_argument("query", help="Show name or Spotify show URL")
+    p_podcast.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Return a stub estimate instead of calling Spotify and Rephonic",
+    )
+    p_podcast.set_defaults(func=cmd_podcast)
 
     p_site = sub.add_parser(
         "site",

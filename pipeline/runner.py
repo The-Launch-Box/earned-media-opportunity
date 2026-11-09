@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from rich.console import Console
 
@@ -10,9 +11,10 @@ from pipeline.config import settings
 from pipeline.emailer import deliver
 from pipeline.feedback import avoidance_guidance
 from pipeline.models import Spokesperson
-from pipeline.research import research_person
-from pipeline.roundup import PersonSection, build_roundup
+from pipeline.research import ClaudeCreditError, format_credit_code, research_person
+from pipeline.roundup import PersonSection, ResearchNotice, build_roundup
 from pipeline.roster import load_roster_from_xlsx
+from pipeline.podcasts import enrich_podcasts
 from pipeline.semrush import enrich_opportunities
 from pipeline.storage import LocalStore, open_store
 
@@ -67,7 +69,6 @@ def run_daily(
       5. Deliver once, then record newly sent fingerprints
     """
     store, synced, newcomers = sync_roster()
-    new_ids = {p.person_id for p in newcomers}
     people = store.list_roster()
 
     if firm_filter:
@@ -78,6 +79,72 @@ def run_daily(
     if limit is not None:
         people = people[:limit]
 
+    return _execute_run(
+        store,
+        people,
+        newcomers=newcomers,
+        synced=synced,
+        dry_run=dry_run,
+        skip_empty=skip_empty,
+        filtered=bool(firm_filter or person_filter or limit is not None),
+    )
+
+
+def run_for_tenant(
+    tenant,
+    *,
+    dry_run: bool = False,
+    delivery_mode: str | None = None,
+    outbox_dir: Path | None = None,
+) -> PipelineResult:
+    """Research one company's roster and send only to that company's recipients.
+
+    The Launch Box list is the shared workbook already in blob storage.
+    Other companies use the speakers saved on their own page.
+    """
+    from pipeline.provision import open_tenant_store
+
+    store = open_tenant_store(tenant)
+    newcomers: list = []
+    if getattr(tenant, "slug", "") == "thelaunchbox":
+        from pipeline.roster import load_roster_from_xlsx
+
+        _, newcomers = store.sync_roster(load_roster_from_xlsx())
+    people = store.list_roster()
+    directory = outbox_dir or (settings.outbox_dir / tenant.slug)
+    return _execute_run(
+        store,
+        people,
+        newcomers=newcomers,
+        synced=len(people),
+        dry_run=dry_run,
+        skip_empty=False,
+        blast_to=tenant.blast_to,
+        outbox_dir=directory,
+        delivery_mode=delivery_mode,
+        file_slug=tenant.slug,
+        empty_message="No speakers yet. Add speakers in the dashboard, then run again.",
+        brief=getattr(tenant, "research_notes", "") or "",
+    )
+
+
+def _execute_run(
+    store: LocalStore,
+    people: list[Spokesperson],
+    *,
+    newcomers: list[Spokesperson],
+    synced: int,
+    dry_run: bool,
+    skip_empty: bool,
+    filtered: bool = False,
+    blast_to: str | None = None,
+    outbox_dir: Path | None = None,
+    delivery_mode: str | None = None,
+    file_slug: str = "",
+    empty_message: str = "No spokespeople matched. Check the SME workbook or filters.",
+    brief: str = "",
+) -> PipelineResult:
+    new_ids = {p.person_id for p in newcomers}
     outcome = PipelineResult(
         synced=synced,
         new_roster_names=[p.name for p in newcomers],
@@ -88,7 +155,6 @@ def run_daily(
             + ", ".join(f"{p.firm} · {p.name}" for p in newcomers)
         )
 
-    filtered = bool(firm_filter or person_filter or limit is not None)
     if dry_run:
         console.print(
             f"[dim]Dry-run stubs for {len(people)} SME"
@@ -104,7 +170,7 @@ def run_daily(
             + "[/]"
         )
     if not people:
-        console.print("[red]No spokespeople matched. Check the SME workbook or filters.[/]")
+        console.print(f"[red]{empty_message}[/]")
         return outcome
 
     rejections = store.rejections()
@@ -116,6 +182,11 @@ def run_daily(
         )
 
     sections: list[PersonSection] = []
+    models: list[str] = []
+    credit_code = ""
+    credit_status: int | None = None
+    completed = 0
+    use_fallback = bool(settings.research_fallback) and not dry_run
 
     for person in people:
         is_new = person.person_id in new_ids
@@ -125,8 +196,35 @@ def run_daily(
             highlight=False,
         )
         result = PersonRunResult(person=person, is_new_to_roster=is_new)
+        if credit_code and not use_fallback:
+            result.error = (
+                f"Claude credits are exhausted (error {credit_code}). "
+                "Remaining people were not sent to Claude."
+            )
+            console.print(f"  [yellow]{result.error}[/]")
+            outcome.results.append(result)
+            continue
         try:
-            research = research_person(person, dry_run=dry_run, avoidance=avoidance)
+            research = research_person(
+                person,
+                dry_run=dry_run,
+                avoidance=avoidance,
+                brief=brief,
+                force_fallback=bool(credit_code) and use_fallback,
+                credit_http_status=credit_status,
+            )
+            if research.model_name and research.model_name not in models:
+                models.append(research.model_name)
+                if research.provider not in {"", "claude", "dry-run"}:
+                    console.print(f"  research model: {research.model_name}")
+            if research.claude_credit_code and not credit_code:
+                credit_code = research.claude_credit_code
+                credit_status = research.claude_credit_http_status
+                console.print(
+                    f"  [yellow]Claude credits are exhausted (error {credit_code}). "
+                    f"Continuing on {research.model_name}.[/]"
+                )
+            completed += 1
             result.found = len(research.opportunities)
             fresh = store.filter_new(person.person_id, research.opportunities)
             blocked = store.rejected_fingerprints()
@@ -153,6 +251,11 @@ def run_daily(
                         is_new=is_new,
                     )
                 )
+        except ClaudeCreditError as exc:
+            credit_code = format_credit_code(exc.code, exc.http_status)
+            credit_status = exc.http_status
+            result.error = str(exc)
+            console.print(f"  [red]error:[/] {exc}")
         except Exception as exc:  # noqa: BLE001 — keep the run going for others
             result.error = str(exc)
             console.print(f"  [red]error:[/] {exc}")
@@ -161,13 +264,13 @@ def run_daily(
 
     if sections:
         _attach_semrush(sections, store=store, dry_run=dry_run)
-        if settings.feedback_public_url:
-            for section in sections:
-                store.issue_feedback(section.person, section.opportunities)
-        else:
+        _attach_podcasts(sections, store=store, dry_run=dry_run)
+        for section in sections:
+            store.issue_feedback(section.person, section.opportunities)
+        if not settings.feedback_public_url:
             console.print(
                 "[yellow]FEEDBACK_PUBLIC_URL is unset — "
-                "the roundup will not include Yes/No links.[/]"
+                "the roundup will not include Go / No-Go / LinkedIn buttons.[/]"
             )
 
     if skip_empty and not sections:
@@ -175,8 +278,32 @@ def run_daily(
         console.print("  no new items — skipping email")
         return outcome
 
-    roundup = build_roundup(sections)
-    delivery = deliver(roundup)
+    model_label = ", ".join(models)
+    if not model_label:
+        model_label = "dry-run stub" if dry_run else settings.claude_model
+    roundup = build_roundup(
+        sections,
+        notice=ResearchNotice(
+            model=model_label,
+            credit_code=credit_code,
+            research_incomplete=bool(credit_code) and completed == 0,
+        ),
+    )
+    if roundup.batch_key:
+        reply_to = settings.blast_to if blast_to is None else (blast_to or "")
+        store.save_batch(
+            roundup.batch_key,
+            roundup.subject,
+            reply_to,
+            roundup.opportunities,
+        )
+    delivery = deliver(
+        roundup,
+        blast_to=blast_to,
+        outbox_dir=outbox_dir,
+        delivery_mode=delivery_mode,
+        file_slug=file_slug,
+    )
     outcome.outbox_path = str(delivery.path) if delivery.path else None
     outcome.urgent = roundup.urgent_count
 
@@ -235,6 +362,44 @@ def _attach_semrush(
     console.print(
         f"Semrush: {stats.domains} unique domain"
         f"{'s' if stats.domains != 1 else ''} ({detail})"
+    )
+    if stats.skipped:
+        console.print(f"  [yellow]stopped early:[/] {stats.skipped}")
+
+
+def _attach_podcasts(
+    sections: list[PersonSection],
+    *,
+    store: LocalStore,
+    dry_run: bool,
+) -> None:
+    """Look up Spotify for podcast items and stamp a listener estimate."""
+    flat = [opp for section in sections for opp in section.opportunities]
+    if not flat:
+        return
+    try:
+        enriched, stats = enrich_podcasts(flat, dry_run=dry_run, store=store)
+    except Exception as exc:  # noqa: BLE001 — roundup still goes out
+        console.print(f"[yellow]Podcast lookup skipped:[/] {exc}")
+        return
+
+    by_fp = {opp.fingerprint: opp for opp in enriched if opp.fingerprint}
+    for section in sections:
+        section.opportunities = [
+            by_fp.get(opp.fingerprint, opp) for opp in section.opportunities
+        ]
+
+    if stats.skipped and stats.fetched == 0 and stats.cached == 0:
+        console.print(f"[yellow]Podcast lookup skipped:[/] {stats.skipped}")
+        return
+    if not stats.checked:
+        return
+    detail = f"{stats.cached} cache, {stats.fetched} live, {stats.matched} on Spotify"
+    if stats.failed:
+        detail += f", {stats.failed} failed"
+    console.print(
+        f"Podcasts: {stats.checked} show"
+        f"{'s' if stats.checked != 1 else ''} ({detail})"
     )
     if stats.skipped:
         console.print(f"  [yellow]stopped early:[/] {stats.skipped}")

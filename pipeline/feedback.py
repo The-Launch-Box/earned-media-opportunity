@@ -1,13 +1,14 @@
-"""Yes/No links in the roundup, and the page that records why a 'no' happened.
+"""Go, No-Go, and Make it LinkedIn links in the roundup.
 
 Email clients do not run JavaScript or submit forms, so each button is a link.
 Opening the link does not save anything (mail scanners follow links). The page
-has the button that writes the verdict. 'No' asks why before it saves.
+has the button that writes the decision. No-Go asks why before it saves.
+Go and Make it LinkedIn queue a draft email; they do not send anything
+to an outlet or publish a post.
 """
 
 from __future__ import annotations
 
-import base64
 import re
 from dataclasses import dataclass
 from html import escape
@@ -15,7 +16,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from pipeline.decisions import decline_from_form, item_number_example
 from pipeline.storage import FeedbackRecord, LocalStore
+from pipeline.wordmark import lockup_html, lockup_styles
 
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _MAX_REASON = 2000
@@ -90,56 +93,35 @@ def handle_feedback_request(
     if method.upper() == "GET":
         if action == "saved":
             return FeedbackHttpResult(200, _saved_page(record, store))
-        error = _followup_block() if action == "linkedin" else ""
-        return FeedbackHttpResult(200, _prompt_page(record, action, error=error))
-    if action == "linkedin":
-        blocked = _followup_block()
+        return FeedbackHttpResult(200, _prompt_page(record, action))
+    if action in {"no", "nogo"}:
+        saved_rows, error = decline_from_form(store, record, (form or {}).get("reason", ""))
+        if error:
+            return FeedbackHttpResult(400, _prompt_page(record, action, error=error))
+        if any(row.token == token for row in saved_rows):
+            return FeedbackHttpResult(303, location=f"/feedback/{token}/saved")
+        return FeedbackHttpResult(200, _batch_saved_page(saved_rows))
+    if action in {"go", "linkedin"}:
+        blocked = _followup_block(store, record)
         if blocked:
-            return FeedbackHttpResult(
-                400, _prompt_page(record, action, error=blocked)
-            )
-        saved = store.record_feedback(token, "linkedin")
-        if saved is None:
-            return FeedbackHttpResult(
-                404,
-                _message_page("Link not found", "That opportunity is no longer on file."),
-            )
+            return FeedbackHttpResult(400, _prompt_page(record, action, error=blocked))
+        store.record_feedback(token, "go" if action == "go" else "linkedin")
         from pipeline.followup import enqueue_followup
 
-        enqueue_followup(store, token, "linkedin")
+        enqueue_followup(store, token, action)
         return FeedbackHttpResult(303, location=f"/feedback/{token}/saved")
-    if action not in {"yes", "no"}:
+    if action != "yes":
         return FeedbackHttpResult(
             404,
             _message_page("Link not found", "That feedback link is not valid."),
         )
-    reason = (form or {}).get("reason", "")
-    if action == "no" and len(reason.strip()) < 3:
-        return FeedbackHttpResult(
-            400,
-            _prompt_page(
-                record,
-                "no",
-                error="Say why in a few words so the next roundup can avoid opportunities like this.",
-            ),
-        )
-    saved = store.record_feedback(token, action, reason)
+    saved = store.record_feedback(token, action)
     if saved is None:
         return FeedbackHttpResult(
             404,
             _message_page("Link not found", "That opportunity is no longer on file."),
         )
     return FeedbackHttpResult(303, location=f"/feedback/{token}/saved")
-
-
-def _followup_block() -> str:
-    from pipeline.config import settings
-
-    if settings.delivery_mode.strip().lower() != "graph":
-        return ""
-    if settings.blast_to.strip():
-        return ""
-    return "No recipient is saved for this roundup, so the draft cannot be emailed."
 
 
 def serve_feedback(store: LocalStore, host: str, port: int) -> None:
@@ -190,7 +172,7 @@ def _route(path: str) -> tuple[str, str] | None:
     if len(parts) != 3 or parts[0] != "feedback":
         return None
     token, action = parts[1], parts[2]
-    if action not in {"yes", "no", "linkedin", "saved"} or not _TOKEN.match(token):
+    if action not in {"yes", "no", "nogo", "go", "linkedin", "saved"} or not _TOKEN.match(token):
         return None
     return token, action
 
@@ -203,27 +185,13 @@ def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
 
 
 _THEME_PATH = Path(__file__).with_name("feedback_theme.css")
-_LOGO_PATH = (
-    Path(__file__).resolve().parent.parent / "assets" / "The Launch Box Logo White (1).png"
-)
-
-
-def _brand_logo() -> str:
-    if not _LOGO_PATH.is_file():
-        return ""
-    encoded = base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
-    return "data:image/png;base64," + encoded
 
 
 def _page(title: str, body: str) -> str:
     """Same chrome as the console: dark Launch Box canvas, wordmark, Manrope."""
     styles = _THEME_PATH.read_text(encoding="utf-8") if _THEME_PATH.is_file() else ""
-    logo = _brand_logo()
-    mark = (
-        f'<a class="brand" href="/"><img class="logo" src="{logo}" alt="The Launch Box"></a>'
-        if logo
-        else '<a class="brand" href="/">The Launch Box</a>'
-    )
+    styles = styles + "\n" + lockup_styles()
+    mark = lockup_html()
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en" class="dark">\n'
@@ -247,8 +215,15 @@ def _page(title: str, body: str) -> str:
 def _opportunity_card(record: FeedbackRecord) -> str:
     outlet = escape(record.outlet) if record.outlet else "Unknown outlet"
     kind = escape(record.opportunity_type or "other")
+    bits = []
+    if record.item_number:
+        bits.append(f"Item {record.item_number}")
+    if record.batch_key:
+        bits.append(escape(record.batch_key))
+    prefix = f'<span class="meta">{" · ".join(bits)}</span><br>' if bits else ""
     return (
         '<div class="card">'
+        f"{prefix}"
         f"<strong>{escape(record.title)}</strong><br>"
         f'<span class="meta">{outlet} · {kind}'
         + (f" · for {escape(record.person_name)}" if record.person_name else "")
@@ -258,10 +233,34 @@ def _opportunity_card(record: FeedbackRecord) -> str:
     )
 
 
+def _followup_block(store: LocalStore, record: FeedbackRecord) -> str:
+    from pipeline.config import settings
+    from pipeline.followup import recipient_for
+
+    if settings.delivery_mode.strip().lower() != "graph":
+        return ""
+    if recipient_for(store, record).strip():
+        return ""
+    return "No recipient is saved for this roundup, so the draft cannot be emailed."
+
+
 def _prompt_page(record: FeedbackRecord, action: str, error: str = "") -> str:
     card = _opportunity_card(record)
     error_html = f'<p class="error">{escape(error)}</p>' if error else ""
     token = escape(record.token)
+    if action == "go":
+        body = (
+            "<h1>Draft a pitch?</h1>"
+            "<p>This emails where to send it, a draft to edit, the angle, and why it is "
+            "worth the time. Nothing is sent to the outlet.</p>"
+            f"{card}"
+            f"{error_html}"
+            f'<form method="post" action="/feedback/{token}/go">'
+            '<button class="go" type="submit">Email the pitch</button>'
+            "</form>"
+            f'<p><a class="quiet" href="/feedback/{token}/nogo">No-Go instead</a></p>'
+        )
+        return _page("Draft a pitch?", body)
     if action == "linkedin":
         who = escape(record.person_name or "the spokesperson")
         body = (
@@ -272,7 +271,7 @@ def _prompt_page(record: FeedbackRecord, action: str, error: str = "") -> str:
             f'<form method="post" action="/feedback/{token}/linkedin">'
             '<button class="linkedin" type="submit">Email the draft</button>'
             "</form>"
-            f'<p><a class="quiet" href="/feedback/{token}/no">No — tell us why</a></p>'
+            f'<p><a class="quiet" href="/feedback/{token}/nogo">No-Go instead</a></p>'
         )
         return _page("Draft a LinkedIn post?", body)
     if action == "yes":
@@ -283,24 +282,32 @@ def _prompt_page(record: FeedbackRecord, action: str, error: str = "") -> str:
             f'<form method="post" action="/feedback/{token}/yes">'
             '<button class="yes" type="submit">Yes</button>'
             "</form>"
-            f'<p><a class="quiet" href="/feedback/{token}/no">No — tell us why</a></p>'
+            f'<p><a class="quiet" href="/feedback/{token}/nogo">No-Go — tell us why</a></p>'
         )
         return _page("Worthwhile opportunity?", body)
 
+    example = escape(item_number_example(record))
+    post_action = "nogo" if action == "nogo" else "no"
     body = (
-        "<h1>Why isn't this worthwhile?</h1>"
-        "<p>This is saved and sent to the next research run so it can avoid opportunities like this.</p>"
+        "<h1>Why is this a no-go?</h1>"
+        "<p>The next search reads this reason, so say what to avoid: the outlet, "
+        "the format, the audience, or why it does not fit this person. "
+        "A no-go without that reason cannot teach the next run.</p>"
+        "<p>You can also reply to the roundup. One line per item, the item number, "
+        f"a period, and the reason — for example {example}. The batch key in the "
+        "subject ties the reply to that email.</p>"
         f"{card}"
         f"{error_html}"
-        f'<form method="post" action="/feedback/{escape(record.token)}/no">'
+        f'<form method="post" action="/feedback/{token}/{post_action}">'
         '<label for="reason">Why</label>'
-        '<textarea id="reason" name="reason" required minlength="3" '
-        'placeholder="Pay-to-play, wrong audience, already pitched, too junior…"></textarea>'
+        f'<textarea id="reason" name="reason" required minlength="3" '
+        f'placeholder="{example}"></textarea>'
         '<button class="no" type="submit">Save</button>'
         "</form>"
-        f'<p><a class="quiet" href="/feedback/{escape(record.token)}/yes">Actually, yes</a></p>'
+        f"{_console_button()}"
+        f'<p><a class="quiet" href="/feedback/{token}/go">Actually, draft a pitch</a></p>'
     )
-    return _page("Why isn't this worthwhile?", body)
+    return _page("Why is this a no-go?", body)
 
 
 def _saved_page(record: FeedbackRecord, store: LocalStore) -> str:
@@ -309,7 +316,10 @@ def _saved_page(record: FeedbackRecord, store: LocalStore) -> str:
     job = store.latest_action(record.token)
     draft_note = ""
     if job is not None and job.kind == "linkedin":
-        draft_note = _job_note(job)
+        draft_note = _job_note(store, record, job, "LinkedIn draft")
+    elif job is not None and job.kind == "go" and record.verdict != "no":
+        draft_note = _job_note(store, record, job, "Pitch")
+
     if record.verdict == "no" and record.reason.strip():
         extra = f"<p>{draft_note}</p>" if draft_note else ""
         body = (
@@ -318,59 +328,77 @@ def _saved_page(record: FeedbackRecord, store: LocalStore) -> str:
             f"{card}"
             f"<p><strong>Why:</strong> {escape(record.reason)}</p>"
             f"{extra}"
-            f'<p><a class="quiet" href="/feedback/{token}/yes">Change this to yes</a></p>'
+            f"{_console_button()}"
+            f'<p><a class="quiet" href="/feedback/{token}/go">Change this to a pitch</a></p>'
         )
         return _page("Saved", body)
-    if job is not None and job.kind == "linkedin" and job.status == "error":
+    if job is not None and job.status == "error":
         body = (
             "<h1>The draft did not go out</h1>"
             f"<p>{escape(job.error or 'Something went wrong.')}</p>"
             f"{card}"
-            f'<p><a class="quiet" href="/feedback/{token}/linkedin">Try again</a></p>'
+            f'<p><a class="quiet" href="/feedback/{token}/{escape(job.kind)}">Try again</a></p>'
         )
         return _page("Draft did not go out", body)
-    if record.verdict == "linkedin" or draft_note:
-        body = (
-            "<h1>Saved</h1>"
-            f"<p>{draft_note or _plain_followup('The LinkedIn draft')}</p>"
-            f"{card}"
-            f'<p><a class="quiet" href="/feedback/{token}/no">Change this to no</a></p>'
-        )
+    if draft_note:
+        body = f"<h1>Saved</h1><p>{draft_note}</p>{card}"
         return _page("Saved", body)
     if record.verdict == "yes":
         body = (
             "<h1>Saved</h1>"
             "<p>Marked as worthwhile. It will not be used as a reason to filter later searches.</p>"
             f"{card}"
-            f'<p><a class="quiet" href="/feedback/{token}/no">Change this to no</a></p>'
+            f'<p><a class="quiet" href="/feedback/{token}/nogo">Change this to no-go</a></p>'
+        )
+        return _page("Saved", body)
+    if record.verdict == "go":
+        body = (
+            "<h1>Saved</h1>"
+            f"<p>{_plain_followup(store, record, 'The pitch')}</p>"
+            f"{card}"
         )
         return _page("Saved", body)
     body = (
-        "<h1>Is this a worthwhile opportunity?</h1>"
+        "<h1>What should we do with this?</h1>"
         f"{card}"
-        f'<p><a class="btn yes" href="/feedback/{token}/yes">Yes</a> '
-        f'<a class="btn no" href="/feedback/{token}/no">No</a> '
+        f'<p><a class="btn go" href="/feedback/{token}/go">Go</a> '
+        f'<a class="btn no" href="/feedback/{token}/nogo">No-Go</a> '
         f'<a class="btn linkedin" href="/feedback/{token}/linkedin">Make it LinkedIn</a></p>'
     )
-    return _page("Worthwhile opportunity?", body)
+    return _page("What should we do with this?", body)
 
 
-def _job_note(job: object) -> str:
-    from pipeline.followup import delivery_blurb
-
+def _job_note(store: LocalStore, record: FeedbackRecord, job: object, label: str) -> str:
     status = getattr(job, "status", "")
-    where = escape(delivery_blurb())
     if status == "error":
-        return f"The LinkedIn draft did not go out. {escape(getattr(job, 'error', '') or '')}"
+        return f"The {label.lower()} did not go out. {escape(getattr(job, 'error', '') or '')}"
     if status == "sent":
-        return f"The LinkedIn draft was sent. {where}"
-    return f"The LinkedIn draft is on the way. {where}"
+        return f"The {label.lower()} was sent. {_plain_followup(store, record, label)}"
+    return _plain_followup(store, record, label)
 
 
-def _plain_followup(label: str) -> str:
-    from pipeline.followup import delivery_blurb
+def _plain_followup(store: LocalStore, record: FeedbackRecord, label: str) -> str:
+    from pipeline.followup import delivery_blurb, recipient_for
 
-    return f"{escape(label)} is on the way. {escape(delivery_blurb())}"
+    return f"{escape(label)} is on the way. {escape(delivery_blurb(recipient_for(store, record)))}"
+
+
+def _batch_saved_page(records: list[FeedbackRecord]) -> str:
+    items = "".join(
+        f"<li>Item {record.item_number}. {escape(record.reason)}</li>"
+        for record in records
+    )
+    body = (
+        "<h1>Saved</h1>"
+        "<p>Future roundups will avoid opportunities like these.</p>"
+        f"<ul>{items}</ul>"
+        f"{_console_button()}"
+    )
+    return _page("Saved", body)
+
+
+def _console_button() -> str:
+    return '<p><a class="btn back" href="/">Back to admin console</a></p>'
 
 
 def _message_page(title: str, message: str) -> str:

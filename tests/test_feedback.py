@@ -74,17 +74,17 @@ def test_roundup_links_only_when_configured() -> None:
         generated_on=date(2026, 9, 25),
         feedback_base_url=base,
     )
-    yes = feedback_href(base, opp.feedback_token, "yes")
-    no = feedback_href(base, opp.feedback_token, "no")
+    go = feedback_href(base, opp.feedback_token, "go")
+    nogo = feedback_href(base, opp.feedback_token, "nogo")
     linkedin = feedback_href(base, opp.feedback_token, "linkedin")
-    assert "Is this a worthwhile opportunity?" in roundup.body_text
-    assert yes in roundup.body_text
+    assert "What should we do with this?" in roundup.body_text
+    assert go in roundup.body_text
     assert "Make it LinkedIn" in roundup.body_text
     assert linkedin in roundup.body_text
-    assert no in roundup.body_html
+    assert nogo in roundup.body_html
     assert linkedin in roundup.body_html
-    assert 'background:#0d6b3d;">Yes</a>' in roundup.body_html
-    assert 'background:#9b1c1c;">No</a>' in roundup.body_html
+    assert 'background:#0d6b3d;">Go</a>' in roundup.body_html
+    assert 'background:#9b1c1c;">No-Go</a>' in roundup.body_html
     assert 'background:#0a66c2;">Make it LinkedIn</a>' in roundup.body_html
 
     quiet = build_roundup(
@@ -92,7 +92,7 @@ def test_roundup_links_only_when_configured() -> None:
         generated_on=date(2026, 9, 25),
         feedback_base_url="",
     )
-    assert "worthwhile" not in quiet.body_html
+    assert "What should we do with this?" not in quiet.body_html
 
 
 def test_get_does_not_save_and_no_requires_a_reason() -> None:
@@ -116,6 +116,9 @@ def _test_get_does_not_save_and_no_requires_a_reason(tmp_path: Path) -> None:
             page = response.read().decode()
             assert response.status == 200
         assert "Yes" in page
+        assert 'href="https://os.thelaunchbox.com"' in page
+        assert "ACCELERATED BY THE LAUNCH BOX" in page
+        assert "Earned media" in page
         assert store.get_feedback(token).verdict == ""
 
         body = urlencode({"reason": "no"}).encode()
@@ -196,7 +199,7 @@ def _test_linkedin_click_queues_a_draft_and_does_not_reject(tmp_path: Path) -> N
             with urlopen(request) as response:
                 saved = response.read().decode()
                 assert response.status == 200
-        assert "LinkedIn draft was sent" in saved
+        assert "linkedin draft was sent" in saved.lower()
         assert store.get_feedback(token).verdict == "no"
         assert opp.fingerprint in store.rejected_fingerprints()
         deliver.assert_called_once()
@@ -215,7 +218,7 @@ def _test_linkedin_click_queues_a_draft_and_does_not_reject(tmp_path: Path) -> N
             )
             with urlopen(request) as response:
                 saved = response.read().decode()
-        assert "LinkedIn draft was sent" in saved
+        assert "linkedin draft was sent" in saved.lower()
         assert store.get_feedback(fresh_token).verdict == "linkedin"
         assert fresh.fingerprint not in store.rejected_fingerprints()
     finally:

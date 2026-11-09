@@ -77,6 +77,8 @@ On the same page, **Search notes** is optional. These instructions go to the res
 
 ## What arrives in your inbox
 
+The first lines name the research model. If Claude is out of credits, the email includes error `anthropic_credit_balance` and asks you to contact your Claude administrator. Research on Claude resumes when that balance is restored. After it is restored in the Anthropic admin console, run the pipeline again to redo that day's run. A configured backup model can finish the same run; the email names that model too.
+
 The subject line looks like this:
 
 `Earned Media Opportunities Roundup [October 19, 2026]`
@@ -86,7 +88,7 @@ The body has two groups:
 - **Time-Sensitive** — deadlines inside about 48 hours, including journalist queries that expire soon.
 - **Other** — the rest.
 
-Under each speaker you get up to five opportunities: a title, the outlet and type (press, podcast, speaking, journalist query, backlink, or other), a link, why it fits, and a suggested angle. When site numbers are available, a line shows estimated monthly visits and a High, Medium, or Low legitimacy label. High means a Semrush Authority Score of 50 or more, Medium is 30–49, and Low is below 30.
+Under each speaker you get up to five opportunities: a title, the outlet and type (press, podcast, speaking, journalist query, backlink, or other), a link, why it fits, and a suggested angle. When Cloudflare Radar is configured, a Site line ranks the outlet’s own domain from DNS queries to 1.1.1.1: an exact global rank for the top 100, a bucket such as top 10K otherwise, or outside the top 1M. That is a traffic-popularity rank, not an estimated visit count. A podcast that is on Spotify also lists subscribers and monthly listeners when Spotify returns them, plus episode count, publisher, and the newest episode. Spotify’s public API usually omits the audience counts.
 
 A quiet day says “No new earned-media opportunities today.” Links already sent for that speaker are left out the next time. A speaker added since the last email is marked as new on the roster.
 

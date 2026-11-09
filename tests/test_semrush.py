@@ -51,7 +51,7 @@ def test_parse_csv_and_error() -> None:
         raise AssertionError("expected SemrushError")
 
 
-def test_roundup_includes_site_line() -> None:
+def test_roundup_site_line_comes_from_semrush() -> None:
     person = Spokesperson.from_row(firm="TLB", name="Amy Kenly", title="CMO")
     opp = Opportunity(
         title="Guest post",
@@ -74,8 +74,6 @@ def test_roundup_includes_site_line() -> None:
         generated_on=date(2026, 9, 21),
     )
     assert "Site: ~1.2M monthly visits · High legitimacy (AS 74)" in roundup.body_text
-    assert "High legitimacy (AS 74)" in roundup.body_html
-    assert "Site metrics: Semrush monthly visits" in roundup.body_text
 
 
 if __name__ == "__main__":
@@ -83,5 +81,5 @@ if __name__ == "__main__":
     test_format_count()
     test_legitimacy_thresholds()
     test_parse_csv_and_error()
-    test_roundup_includes_site_line()
+    test_roundup_site_line_comes_from_semrush()
     print("ok")

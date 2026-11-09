@@ -7,6 +7,7 @@ from datetime import date
 from html import escape
 
 from pipeline.config import settings
+from pipeline.decisions import batch_key_for
 from pipeline.feedback import feedback_href
 from pipeline.models import Opportunity, Roundup, Spokesperson
 
@@ -24,11 +25,21 @@ class PersonSection:
     is_new: bool = False
 
 
+@dataclass
+class ResearchNotice:
+    """Model line, and the Claude credit notice when that balance is exhausted."""
+
+    model: str = ""
+    credit_code: str = ""
+    research_incomplete: bool = False
+
+
 def build_roundup(
     sections: list[PersonSection],
     *,
     generated_on: date | None = None,
     feedback_base_url: str | None = None,
+    notice: ResearchNotice | None = None,
 ) -> Roundup:
     """
     One blast for the whole roster:
@@ -45,31 +56,43 @@ def build_roundup(
     """
     today = generated_on or date.today()
     date_label = today.strftime("%B %-d, %Y")
-    subject = f"Earned Media Opportunities Roundup [{date_label}]"
 
     ordered = _with_newcomers_last(sections)
+    numbered = _number_in_email_order(ordered, today)
+    batch_key = batch_key_for(
+        today.isoformat(),
+        [opp.fingerprint for opp in numbered],
+    )
+    for opp in numbered:
+        opp.batch_key = batch_key
+    subject = f"Earned Media Opportunities Roundup [{date_label}]"
+    if batch_key:
+        subject = f"{subject} [{batch_key}]"
+
     people = [s.person for s in ordered]
     new_names = [s.person.name for s in ordered if s.is_new]
-    all_opps = [o for s in ordered for o in s.opportunities]
-    urgent_count = sum(
-        1 for s in ordered for o in s.opportunities if o.is_urgent(today=today)
-    )
+    urgent_count = sum(1 for opp in numbered if opp.is_urgent(today=today))
 
     feedback_base = (
         settings.feedback_public_url if feedback_base_url is None else feedback_base_url
     ).rstrip("/")
-    body_text = _text_body(ordered, date_label, new_names, today, feedback_base)
-    body_html = _html_body(ordered, date_label, new_names, today, feedback_base)
+    body_text = _text_body(
+        ordered, subject, new_names, today, feedback_base, batch_key, notice
+    )
+    body_html = _html_body(
+        ordered, subject, new_names, today, feedback_base, batch_key, notice
+    )
 
     return Roundup(
         subject=subject,
         body_text=body_text,
         body_html=body_html,
-        opportunities=all_opps,
+        opportunities=numbered,
         people=people,
         new_people=new_names,
         urgent_count=urgent_count,
         generated_on=today.isoformat(),
+        batch_key=batch_key,
     )
 
 
@@ -92,17 +115,77 @@ def _split(
     return urgent, other
 
 
+def _number_in_email_order(
+    sections: list[PersonSection], today: date
+) -> list[Opportunity]:
+    """Time-sensitive items first, then the rest, in the order the email shows them."""
+    flat: list[Opportunity] = []
+    for bucket in (0, 1):
+        for section in sections:
+            flat.extend(_split(section, today)[bucket])
+    for number, opp in enumerate(flat, start=1):
+        opp.item_number = number
+    return flat
+
+
+def _notice_lines(notice: ResearchNotice | None) -> list[str]:
+    if notice is None or not (notice.model or notice.credit_code):
+        return []
+    lines: list[str] = []
+    if notice.model:
+        lines.append(f"Research model: {notice.model}")
+    if notice.credit_code:
+        lines.append(_credit_line(notice))
+    return lines
+
+
+def _credit_line(notice: ResearchNotice) -> str:
+    line = (
+        f"Claude credits are exhausted (error {notice.credit_code}). "
+        "Contact your Claude administrator to restore access. "
+        "Functionality will resume when the Claude balance is restored. "
+    )
+    if notice.research_incomplete:
+        return (
+            line
+            + "After the balance is restored in the Anthropic admin console, "
+            "run the pipeline again to redo this day's run."
+        )
+    return (
+        line
+        + "This run continued on the model named above. "
+        "After the balance is restored in the Anthropic admin console, "
+        "run the pipeline again to redo this day's run on Claude. "
+        "Opportunities already listed below stay on the sent list."
+    )
+
+
+def _empty_day_line(notice: ResearchNotice | None) -> str:
+    if notice is not None and notice.credit_code and notice.research_incomplete:
+        return "This day's research did not run."
+    return "No new earned-media opportunities today."
+
+
 def _text_body(
     sections: list[PersonSection],
-    date_label: str,
+    subject: str,
     new_names: list[str],
     today: date,
     feedback_base: str,
+    batch_key: str,
+    notice: ResearchNotice | None = None,
 ) -> str:
     lines = [
-        f"Subject: Earned Media Opportunities Roundup [{date_label}]",
+        f"Subject: {subject}",
         "",
     ]
+    notice_lines = _notice_lines(notice)
+    if notice_lines:
+        lines.extend(notice_lines)
+        lines.append("")
+    if batch_key:
+        lines.append(f"Batch {batch_key}")
+        lines.append("")
     if new_names:
         lines.append(
             "New on the roster: "
@@ -139,7 +222,7 @@ def _text_body(
             lines.append("")
 
     if not time_sensitive and not other:
-        lines.append("No new earned-media opportunities today.")
+        lines.append(_empty_day_line(notice))
         lines.append("")
 
     if _has_site_metrics(sections):
@@ -148,13 +231,27 @@ def _text_body(
             "High legitimacy = AS 50+, Medium = 30–49, Low = below 30."
         )
         lines.append("")
+    if _has_podcast_reach(sections):
+        lines.append(
+            "Podcast reach: estimated weekly downloads from Rephonic "
+            "for shows found on Spotify. Spotify's own API does not publish listener counts."
+        )
+        lines.append("")
+    if batch_key:
+        lines.append(
+            "To pass on an item, reply to this email. Each line starts with that "
+            "item's number, then a period, then the reason you are passing. "
+            "The reason is what the next search uses, so name the outlet, the format, or the fit."
+        )
+        lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 
 
 def _item_lines(opp: Opportunity, feedback_base: str) -> list[str]:
     due = f" ({opp.deadline})" if opp.deadline else ""
-    lines = [f"• {opp.title}{due}"]
+    number = f"{opp.item_number}. " if opp.item_number else ""
+    lines = [f"{number}{opp.title}{due}"]
     if opp.outlet:
         lines.append(f"  Outlet: {opp.outlet} ({opp.opportunity_type})")
     else:
@@ -162,6 +259,8 @@ def _item_lines(opp: Opportunity, feedback_base: str) -> list[str]:
     lines.append(f"  Link: {opp.url}")
     if opp.site:
         lines.append(f"  {opp.site.summary_line()}")
+    if opp.podcast and (reach := opp.podcast.summary_line()):
+        lines.append(f"  {reach}")
     if opp.why_relevant:
         lines.append(f"  Why: {opp.why_relevant}")
     if opp.suggested_angle:
@@ -173,29 +272,35 @@ def _item_lines(opp: Opportunity, feedback_base: str) -> list[str]:
 def _feedback_text(opp: Opportunity, feedback_base: str) -> list[str]:
     if not feedback_base or not opp.feedback_token:
         return []
-    yes = feedback_href(feedback_base, opp.feedback_token, "yes")
-    no = feedback_href(feedback_base, opp.feedback_token, "no")
+    go = feedback_href(feedback_base, opp.feedback_token, "go")
+    nogo = feedback_href(feedback_base, opp.feedback_token, "nogo")
     linkedin = feedback_href(feedback_base, opp.feedback_token, "linkedin")
     return [
-        "  Is this a worthwhile opportunity?",
-        f"  Yes: {yes}",
-        f"  No: {no}",
+        "  What should we do with this?",
+        f"  Go: {go}",
+        f"  No-Go: {nogo}",
         f"  Make it LinkedIn: {linkedin}",
     ]
 
 
 def _html_body(
     sections: list[PersonSection],
-    date_label: str,
+    subject: str,
     new_names: list[str],
     today: date,
     feedback_base: str,
+    batch_key: str,
+    notice: ResearchNotice | None = None,
 ) -> str:
     chunks: list[str] = [
         "<!DOCTYPE html>",
         '<html><body style="font-family: Georgia, serif; line-height: 1.5; color: #1a1a1a;">',
-        f"<p><strong>Subject: Earned Media Opportunities Roundup [{escape(date_label)}]</strong></p>",
+        f"<p><strong>Subject: {escape(subject)}</strong></p>",
     ]
+    for line in _notice_lines(notice):
+        chunks.append(f"<p>{escape(line)}</p>")
+    if batch_key:
+        chunks.append(f"<p>Batch {escape(batch_key)}</p>")
     if new_names:
         names = ", ".join(escape(n) for n in new_names)
         chunks.append(
@@ -226,13 +331,28 @@ def _html_body(
             chunks.append(_items_html(opps, feedback_base))
 
     if not time_sensitive and not other:
-        chunks.append("<p>No new earned-media opportunities today.</p>")
+        chunks.append(f"<p>{escape(_empty_day_line(notice))}</p>")
 
     if _has_site_metrics(sections):
         chunks.append(
             "<p style=\"font-size: 0.9em; color: #555;\">"
             "Site metrics: Semrush monthly visits and Authority Score. "
             "High legitimacy = AS 50+, Medium = 30–49, Low = below 30."
+            "</p>"
+        )
+    if _has_podcast_reach(sections):
+        chunks.append(
+            "<p style=\"font-size: 0.9em; color: #555;\">"
+            "Podcast reach: estimated weekly downloads from Rephonic "
+            "for shows found on Spotify. Spotify's own API does not publish listener counts."
+            "</p>"
+        )
+    if batch_key:
+        chunks.append(
+            "<p style=\"font-size: 0.9em; color: #555;\">"
+            "To pass on an item, reply to this email. Each line starts with that "
+            "item's number, then a period, then the reason you are passing. "
+            "The reason is what the next search uses, so name the outlet, the format, or the fit."
             "</p>"
         )
 
@@ -252,27 +372,30 @@ def _items_html(opportunities: list[Opportunity], feedback_base: str) -> str:
         extra = ""
         if opp.site:
             extra += f"<br>{_site_html(opp)}"
+        if opp.podcast and (reach := opp.podcast.summary_line()):
+            extra += f"<br>{escape(reach)}"
         if opp.why_relevant:
             extra += f"<br>Why: {escape(opp.why_relevant)}"
         if opp.suggested_angle:
             extra += f"<br>Angle: {escape(opp.suggested_angle)}"
         extra += _feedback_html(opp, feedback_base)
+        number = f"{opp.item_number}. " if opp.item_number else ""
         items.append(
-            "<li>"
-            f"{escape(opp.title)}{due}<br>"
+            '<div style="margin:0 0 1.15rem 0;">'
+            f"<strong>{escape(number)}</strong>{escape(opp.title)}{due}<br>"
             f"{meta}<br>"
             f'<a href="{escape(opp.url)}">{escape(opp.url)}</a>'
             f"{extra}"
-            "</li>"
+            "</div>"
         )
-    return f"<ul>{''.join(items)}</ul>"
+    return "".join(items)
 
 
 def _feedback_html(opp: Opportunity, feedback_base: str) -> str:
     if not feedback_base or not opp.feedback_token:
         return ""
-    yes = escape(feedback_href(feedback_base, opp.feedback_token, "yes"))
-    no = escape(feedback_href(feedback_base, opp.feedback_token, "no"))
+    go = escape(feedback_href(feedback_base, opp.feedback_token, "go"))
+    nogo = escape(feedback_href(feedback_base, opp.feedback_token, "nogo"))
     linkedin = escape(feedback_href(feedback_base, opp.feedback_token, "linkedin"))
     button = (
         "display:inline-block;padding:6px 12px;color:#ffffff;"
@@ -280,14 +403,14 @@ def _feedback_html(opp: Opportunity, feedback_base: str) -> str:
     )
     return (
         '<br><span style="display:inline-block;margin-top:8px;">'
-        "Is this a worthwhile opportunity?</span><br>"
+        "What should we do with this?</span><br>"
         '<table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:6px;">'
         "<tr>"
         '<td style="padding-right:8px;">'
-        f'<a href="{yes}" style="{button}background:#0d6b3d;">Yes</a>'
+        f'<a href="{go}" style="{button}background:#0d6b3d;">Go</a>'
         "</td>"
         '<td style="padding-right:8px;">'
-        f'<a href="{no}" style="{button}background:#9b1c1c;">No</a>'
+        f'<a href="{nogo}" style="{button}background:#9b1c1c;">No-Go</a>'
         "</td><td>"
         f'<a href="{linkedin}" style="{button}background:#0a66c2;">Make it LinkedIn</a>'
         "</td></tr></table>"
@@ -296,6 +419,14 @@ def _feedback_html(opp: Opportunity, feedback_base: str) -> str:
 
 def _has_site_metrics(sections: list[PersonSection]) -> bool:
     return any(opp.site for s in sections for opp in s.opportunities)
+
+
+def _has_podcast_reach(sections: list[PersonSection]) -> bool:
+    return any(
+        opp.podcast and opp.podcast.summary_line()
+        for s in sections
+        for opp in s.opportunities
+    )
 
 
 def _site_html(opp: Opportunity) -> str:

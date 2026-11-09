@@ -8,7 +8,8 @@ Local implementation of [earned-media-pipeline-architecture.md](./earned-media-p
 | Azure Table Storage (roster) | `TLB PortCo SME List.xlsx` → SQLite |
 | Azure Table Storage (sent fingerprints) | SQLite `sent_opportunities` |
 | Claude API + web search | Anthropic SDK (`python -m pipeline run`) |
-| Semrush visits + legitimacy | `SEMRUSH_API_KEY` → Site line on each opportunity |
+| Site traffic | `CLOUDFLARE_API_TOKEN` → Cloudflare Radar rank on each outlet domain |
+| Podcast audience | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` → subscribers and monthly listeners for podcasts |
 | Microsoft Graph email | `DELIVERY_MODE=graph` (device-code login) + `outbox/` copy |
 
 ## Setup
@@ -17,12 +18,16 @@ Local implementation of [earned-media-pipeline-architecture.md](./earned-media-p
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # add ANTHROPIC_API_KEY and SEMRUSH_API_KEY
+cp .env.example .env   # add ANTHROPIC_API_KEY, and optionally Cloudflare and Spotify keys
 ```
 
 Optional: put real addresses in `config/emails.json` (the spreadsheet has no email column). Outbox delivery works without them.
 
-Add `SEMRUSH_API_KEY` to `.env` so each opportunity is tagged with estimated monthly visits and a High / Medium / Low legitimacy score (Semrush Authority Score). Without the key, the roundup still sends and those Site lines are omitted.
+Claude is the research model. If that account is out of credits and `RESEARCH_FALLBACK=foundry`, the run continues on Azure AI Foundry (`FOUNDRY_ENDPOINT`, `FOUNDRY_API_KEY`, `FOUNDRY_MODEL`) using that API's web search tool. With no fallback configured, the roundup still sends. The top of the email names the model used. When Claude credits are exhausted it also includes error `anthropic_credit_balance`, asks the reader to contact their Claude administrator, and says to run the pipeline again after the balance is restored in the Anthropic admin console.
+
+Add `CLOUDFLARE_API_TOKEN` (Account → Radar → Read) for a Site line from Cloudflare Radar. That rank comes from DNS queries to 1.1.1.1: an exact global rank for the top 100, otherwise a bucket such as top 10K, or “outside the top 1M.” It is a traffic-popularity rank, not an estimated visit count. Links on Spotify, YouTube, Apple, and similar hosts are skipped, because that rank would describe the platform. Without the token, the Site line is omitted and the roundup still sends.
+
+Podcast opportunities that are on Spotify get a Podcast line. Subscriber count is Spotify’s follower total, and monthly listeners are included when the show object returns them. The public Web API usually omits both, and then the line shows episode count, publisher, and the newest episode date. A show is included when the link is a Spotify show or episode URL, or when the outlet name matches a Spotify show. Press, speaking, and other types are not sent to Spotify.
 
 ## Commands
 
@@ -48,9 +53,12 @@ python -m pipeline run              # live search + send
 # Inspect dedupe store
 python -m pipeline sent
 
-# Look up Semrush visits + legitimacy for one outlet
+# Cloudflare Radar site traffic for one outlet domain
 python -m pipeline site cio.com
-python -m pipeline site --dry-run example.com
+python -m pipeline radar --dry-run example.com
+
+# Spotify subscribers and monthly listeners for one podcast
+python -m pipeline podcast "Acquired"
 
 # Yes/No on each opportunity (leave the server running; set FEEDBACK_PUBLIC_URL)
 python -m pipeline serve
@@ -68,7 +76,7 @@ No opens a page that asks why. That reason is stored in SQLite and added to the 
 ## Layout
 
 ```
-pipeline/          # roster, storage, research, Semrush scoring, roundup, emailer, runner, CLI
+pipeline/          # roster, storage, research, Radar site traffic, Spotify audience, roundup, emailer, runner, CLI
 config/emails.json # optional name → email overlay
 data/pipeline.db   # local table-storage stand-in (gitignored)
 outbox/            # generated roundups (gitignored)
@@ -85,7 +93,7 @@ The app is a morning research job plus a small website for the Yes/No links. On 
 1. It reads `TLB PortCo SME List.xlsx` into SQLite. Each spokesperson gets a stable id from their firm and name.
 2. For each person, it asks Claude, with web search turned on, for up to five recent press, podcast, speaking, journalist-query, or backlink opportunities. The prompt includes any “not worthwhile” reasons already saved.
 3. It drops links already sent to that person, and links the team has rejected.
-4. It asks Semrush for monthly visits and an Authority Score on each outlet, and caches that for a week.
+4. When `CLOUDFLARE_API_TOKEN` is set, it asks Cloudflare Radar for each outlet domain’s traffic rank and caches that for a week. Podcast items that match a Spotify show get subscriber and monthly listener counts when Spotify returns them, plus episode count, publisher, and the newest episode date.
 5. It writes one team email: Time-Sensitive first, then Other, grouped by person. With `DELIVERY_MODE=graph`, Microsoft Graph sends that HTML from your mailbox to `BLAST_TO`. A copy also lands in `outbox/`.
 6. It records each URL it sent, so the next run skips it.
 
@@ -106,9 +114,9 @@ Use one Python Function App with two functions:
 
 The Yes/No links in the email point at that HTTPS address. A click wakes the HTTP function, saves the verdict, and the next timer run reads it. A cold start of a few seconds is fine for that page.
 
-Four things in the current code have to change before that works. The research, roundup wording, and Semrush scoring can stay as they are.
+Four things in the current code have to change before that works. The research and roundup wording can stay as they are.
 
-**Storage.** A Consumption function’s disk disappears when the run ends, so SQLite will not remember yesterday’s links or today’s “no.” The tables already in use — roster, sent links, Semrush cache, and feedback — map onto Azure Table Storage. `pipeline/storage.py` is the adapter to swap.
+**Storage.** A Consumption function’s disk disappears when the run ends, so SQLite will not remember yesterday’s links or today’s “no.” The tables already in use — roster, sent links, Radar cache, podcast lookups, and feedback — map onto Azure Table Storage. `pipeline/storage.py` is the adapter to swap.
 
 **Mail login.** Today Graph sends as you, using a device-code sign-in saved in `data/msal_token_cache.bin`. A timer cannot show that prompt. Register an app permission to send as the mailbox (`Mail.Send` with admin consent) and call `/users/{mailbox}/sendMail` instead of `/me/sendMail`.
 

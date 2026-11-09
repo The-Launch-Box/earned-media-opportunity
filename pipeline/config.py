@@ -20,6 +20,11 @@ class Settings:
 
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     claude_model: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+    # foundry | empty. Used when Claude credits are exhausted.
+    research_fallback: str = os.getenv("RESEARCH_FALLBACK", "").strip().lower()
+    foundry_endpoint: str = os.getenv("FOUNDRY_ENDPOINT", "").strip().rstrip("/")
+    foundry_api_key: str = os.getenv("FOUNDRY_API_KEY", "").strip()
+    foundry_model: str = os.getenv("FOUNDRY_MODEL", "").strip()
     web_search_tool_type: str = os.getenv("WEB_SEARCH_TOOL_TYPE", "web_search_20250305")
     max_search_uses: int = int(os.getenv("MAX_SEARCH_USES", "5"))
     max_tokens: int = int(os.getenv("MAX_TOKENS", "4096"))
@@ -53,6 +58,13 @@ class Settings:
     semrush_use_traffic_analytics: bool = os.getenv(
         "SEMRUSH_USE_TRAFFIC_ANALYTICS", "true"
     ).lower() in {"1", "true", "yes"}
+
+    # Podcast reach: Spotify confirms the show; Rephonic supplies the estimate.
+    spotify_client_id: str = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+    spotify_client_secret: str = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+    spotify_market: str = os.getenv("SPOTIFY_MARKET", "US").strip() or "US"
+    rephonic_api_key: str = os.getenv("REPHONIC_API_KEY", "").strip()
+    podcast_cache_days: int = int(os.getenv("PODCAST_CACHE_DAYS", "7") or "7")
 
     # Public base URL readers can open from the roundup email (no trailing path).
     # Empty hides the Yes/No links. Example: http://127.0.0.1:8787

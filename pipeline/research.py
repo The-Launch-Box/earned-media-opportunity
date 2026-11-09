@@ -1,4 +1,9 @@
-"""Claude web-search research for one spokesperson."""
+"""Claude web-search research for one spokesperson.
+
+When Claude reports that the credit balance is exhausted, research can continue
+on Azure AI Foundry if RESEARCH_FALLBACK=foundry. Other Claude errors stay on
+Claude and fail that person only.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,8 @@ from typing import Any
 
 from pipeline.config import settings
 from pipeline.models import Opportunity, ResearchResult, Spokesperson, url_fingerprint
+
+CREDIT_CODE = "anthropic_credit_balance"
 
 
 SYSTEM = """You are an earned-media research assistant for a professional-services \
@@ -29,10 +36,11 @@ After searching, respond with JSON only — no markdown fences, no extra prose.
 """
 
 
-def _user_prompt(person: Spokesperson, avoidance: str = "") -> str:
+def _user_prompt(person: Spokesperson, avoidance: str = "", brief: str = "") -> str:
     prior = person.prior_work or "(none listed)"
     rules = f"\n{avoidance.strip()}\n" if avoidance.strip() else ""
-    return f"""Research earned-media opportunities for this spokesperson.
+    notes = _brief_block(brief)
+    head = f"""Research earned-media opportunities for this spokesperson.
 
 Firm: {person.firm}
 Name: {person.name}
@@ -48,8 +56,8 @@ Search for recent (roughly last 14–30 days) opportunities matching their exper
 - speaking / panel / webinar CFPs
 - trade press story hooks where they could comment
 - guest post / backlink opportunities on reputable industry sites
-
-Return ONLY a JSON object (no markdown fences) with this shape:
+"""
+    tail = f"""Return ONLY a JSON object (no markdown fences) with this shape:
 {{
   "summary": "1-3 sentence overview of what you found",
   "opportunities": [
@@ -73,6 +81,46 @@ in deadline (for example "24 hours" or "2026-09-02").
 If nothing worthwhile is available, return {{"summary": "...", "opportunities": []}}.
 Cap at 5 opportunities, best first.
 {rules}"""
+    return head + notes + tail
+
+
+class ClaudeCreditError(RuntimeError):
+    """Claude refused the call because the account balance is exhausted."""
+
+    def __init__(self, *, http_status: int | None = None, fallback_detail: str = "") -> None:
+        self.code = CREDIT_CODE
+        self.http_status = http_status
+        self.fallback_detail = fallback_detail
+        message = (
+            "Claude credits are exhausted "
+            f"(error {format_credit_code(CREDIT_CODE, http_status)}). "
+            "Contact your Claude administrator to restore access."
+        )
+        if fallback_detail:
+            message = f"{message} Fallback failed: {fallback_detail}"
+        super().__init__(message)
+
+
+def format_credit_code(code: str, http_status: int | None) -> str:
+    if http_status:
+        return f"{code} (HTTP {http_status})"
+    return code
+
+
+def is_claude_credit_error(exc: BaseException) -> bool:
+    """True when an Anthropic error is the out-of-credits response."""
+    text = str(exc).lower()
+    if "credit balance is too low" in text:
+        return True
+    if "insufficient" in text and "credit" in text:
+        return True
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        message = error.get("message") if isinstance(error, dict) else ""
+        if "credit balance is too low" in str(message).lower():
+            return True
+    return False
 
 
 def research_person(
@@ -80,11 +128,24 @@ def research_person(
     *,
     dry_run: bool | None = None,
     avoidance: str = "",
+    brief: str = "",
+    force_fallback: bool = False,
+    credit_http_status: int | None = None,
 ) -> ResearchResult:
     use_dry = settings.dry_run_research or bool(dry_run)
     if use_dry:
         return _mock_research(person)
+    if force_fallback:
+        if not settings.research_fallback:
+            raise ClaudeCreditError(http_status=credit_http_status)
+        return _mark_credit(
+            _run_fallback(person, avoidance, brief),
+            http_status=credit_http_status,
+        )
+
     if not settings.anthropic_api_key:
+        if settings.research_fallback:
+            return _run_fallback(person, avoidance, brief)
         raise RuntimeError(
             "ANTHROPIC_API_KEY is missing. Add it to .env, or pass --dry-run."
         )
@@ -95,7 +156,25 @@ def research_person(
         raise RuntimeError("anthropic package required; pip install anthropic") from exc
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    response = _run_live_research(client, person, avoidance=avoidance)
+    try:
+        response = _run_live_research(client, person, avoidance=avoidance, brief=brief)
+    except ClaudeCreditError:
+        raise
+    except Exception as exc:
+        if not is_claude_credit_error(exc):
+            raise
+        status = _credit_status(exc)
+        if not settings.research_fallback:
+            raise ClaudeCreditError(http_status=status) from exc
+        try:
+            result = _run_fallback(person, avoidance, brief)
+        except Exception as fallback_exc:
+            raise ClaudeCreditError(
+                http_status=status,
+                fallback_detail=str(fallback_exc),
+            ) from fallback_exc
+        return _mark_credit(result, http_status=status)
+
     parsed = _parse_json_payload(_extract_text(response))
     opportunities = [_to_opportunity(item) for item in parsed.get("opportunities", [])]
     opportunities = [o for o in opportunities if o.url]
@@ -104,7 +183,31 @@ def research_person(
         opportunities=opportunities,
         raw_summary=str(parsed.get("summary", "")).strip(),
         search_count=_search_count(response),
+        model_name=settings.claude_model,
+        provider="claude",
     )
+
+
+def _run_fallback(person: Spokesperson, avoidance: str, brief: str = "") -> ResearchResult:
+    from pipeline.fallback import fallback_research
+
+    return fallback_research(person, avoidance=avoidance, brief=brief)
+
+
+def _mark_credit(result: ResearchResult, *, http_status: int | None = None) -> ResearchResult:
+    result.claude_credit_code = format_credit_code(CREDIT_CODE, http_status)
+    result.claude_credit_http_status = http_status
+    return result
+
+
+def _credit_status(exc: BaseException) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    match = re.search(r"error code:\s*(\d{3})", str(exc), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def _web_search_tool() -> dict[str, Any]:
@@ -123,10 +226,31 @@ def _web_search_tool() -> dict[str, Any]:
     return tool
 
 
-def _run_live_research(client: Any, person: Spokesperson, avoidance: str = "") -> Any:
+def _brief_block(brief: str) -> str:
+    """Company notes from the dashboard. Empty when they have not written any."""
+    lines = [" ".join(line.split()) for line in (brief or "").splitlines()]
+    text = "\n".join(line for line in lines if line)
+    if len(text) > 2000:
+        text = text[:2000].rstrip()
+    if not text:
+        return ""
+    return (
+        "\nCompany instructions — follow these when they conflict with the default mix above. "
+        "Still return only the JSON object, and still copy real URLs from web search:\n"
+        + text
+        + "\n"
+    )
+
+
+def _run_live_research(
+    client: Any,
+    person: Spokesperson,
+    avoidance: str = "",
+    brief: str = "",
+) -> Any:
     """Call Claude and continue if a long search returns pause_turn."""
     messages: list[dict[str, Any]] = [
-        {"role": "user", "content": _user_prompt(person, avoidance)}
+        {"role": "user", "content": _user_prompt(person, avoidance, brief)}
     ]
     last = None
     for _ in range(4):
