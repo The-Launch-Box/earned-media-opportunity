@@ -70,9 +70,14 @@ def acquire_graph_token(*, interactive: bool = True) -> str:
     account = _matching_account(app)
     result = None
     if account:
-        result = app.acquire_token_silent(DELEGATED_SCOPES, account=account)
+        result = app.acquire_token_silent_with_error(DELEGATED_SCOPES, account=account)
         if result and "access_token" in result:
             console.print("[dim]Using cached Microsoft login (no browser prompt)[/]")
+        elif result and interactive:
+            console.print(
+                "[yellow]Saved Microsoft login was refused"
+                f"{_silent_failure(result)}[/]"
+            )
 
     if not result or "access_token" not in result:
         if not interactive:
@@ -185,12 +190,18 @@ def send_roundup_email(
     subject: str,
     html_body: str,
     to_addrs: list[str] | None = None,
-) -> None:
+) -> list[str]:
+    """Send one HTML email and return the addresses it actually went to."""
     recipients = [item.strip() for item in (to_addrs or []) if item.strip()]
     if not recipients:
         fallback = settings.blast_to.strip()
         if fallback:
             recipients = [fallback]
+    if settings.send_to_self:
+        if not settings.mail_from.strip():
+            raise RuntimeError("SEND_TO_SELF is on but MAIL_FROM is empty.")
+        recipients = [settings.mail_from.strip()]
+        subject = f"[TEST] {subject}"
     if not recipients:
         raise RuntimeError("BLAST_TO is empty. Set it in .env (Amy's address).")
 
@@ -215,6 +226,7 @@ def send_roundup_email(
         raise RuntimeError(
             f"Graph sendMail failed ({response.status_code}): {response.text[:800]}"
         )
+    return recipients
 
 
 def _matching_account(app: object) -> dict | None:
@@ -234,7 +246,8 @@ def _silent_failure(result: dict | None) -> str:
     if not result:
         return ""
     detail = result.get("error_description") or result.get("error") or ""
-    return f" ({str(detail).splitlines()[0]})" if detail else ""
+    detail = str(detail).splitlines()[0].split(" Trace ID:")[0] if detail else ""
+    return f" ({detail})" if detail else ""
 
 
 class FileTokenCache:

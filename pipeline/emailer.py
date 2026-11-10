@@ -73,7 +73,7 @@ def deliver(
     try:
         from pipeline.graph_mail import send_roundup_email
 
-        send_roundup_email(
+        sent_to = send_roundup_email(
             subject=roundup.subject,
             html_body=roundup.body_html,
             to_addrs=recipients,
@@ -88,7 +88,8 @@ def deliver(
         )
 
     console.print(
-        f"  [green]sent[/] {settings.mail_from} → {', '.join(recipients)}"
+        f"  [green]sent[/] {settings.mail_from} → {', '.join(sent_to)}"
+        + (" [yellow](SEND_TO_SELF test mode)[/]" if settings.send_to_self else "")
     )
     return DeliveryResult(mode="graph", path=text_path, mailed=True)
 

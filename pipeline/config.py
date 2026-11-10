@@ -34,6 +34,8 @@ class Settings:
     from_name: str = os.getenv("FROM_NAME", "Earned Media Roundup")
     blast_to: str = os.getenv("BLAST_TO", "")
     mail_from: str = os.getenv("MAIL_FROM", "")
+    # Testing: every Graph send goes to MAIL_FROM instead of its real recipients.
+    send_to_self: bool = os.getenv("SEND_TO_SELF", "").lower() in {"1", "true", "yes"}
     azure_tenant_id: str = os.getenv("AZURE_TENANT_ID", "")
     # GRAPH_* is the Function App name so AZURE_CLIENT_ID stays free for managed identity.
     azure_client_id: str = os.getenv("GRAPH_CLIENT_ID") or os.getenv("AZURE_CLIENT_ID", "")
