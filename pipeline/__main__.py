@@ -88,9 +88,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 1 if errors else 0
 
 
-def cmd_auth(_args: argparse.Namespace) -> int:
+def cmd_auth(args: argparse.Namespace) -> int:
     from pipeline.config import settings
-    from pipeline.graph_mail import acquire_graph_token
+    from pipeline.graph_mail import acquire_graph_token, upload_token_cache
 
     if not settings.azure_tenant_id or not settings.azure_client_id:
         console.print(
@@ -102,6 +102,17 @@ def cmd_auth(_args: argparse.Namespace) -> int:
         "[green]Microsoft login cached.[/] "
         "python -m pipeline run can now send to "
         f"{settings.blast_to or 'BLAST_TO'}."
+    )
+    if not args.upload:
+        return 0
+    vault_url = (args.vault_url or settings.graph_token_vault_url).strip()
+    if not vault_url:
+        console.print("[red]Pass --vault-url or set GRAPH_TOKEN_VAULT_URL.[/]")
+        return 1
+    upload_token_cache(vault_url, settings.graph_token_secret)
+    console.print(
+        f"[green]Uploaded[/] to {vault_url} secret {settings.graph_token_secret}. "
+        "The Function App sends with this login when GRAPH_TOKEN_VAULT_URL is set."
     )
     return 0
 
@@ -256,7 +267,42 @@ def cmd_podcast(args: argparse.Namespace) -> int:
     return 0 if audience.on_spotify or args.dry_run else 1
 
 
-def cmd_site(args: argparse.Namespace) -> int:
+def cmd_radar(args: argparse.Namespace) -> int:
+    from pipeline.config import settings
+    from pipeline.radar import RadarClient
+
+    if not args.dry_run and not settings.cloudflare_api_token:
+        console.print(
+            "[red]CLOUDFLARE_API_TOKEN is missing from .env. "
+            "Pass --dry-run to print a stub rank.[/]"
+        )
+        return 1
+
+    client = RadarClient(store=open_store(), dry_run=args.dry_run)
+    try:
+        metrics = client.lookup(args.target)
+    finally:
+        client.close()
+
+    table = Table(title=f"Site traffic · {metrics.domain or args.target}")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Site line", metrics.summary_line() or "—")
+    table.add_row("Global rank", str(metrics.rank) if metrics.rank is not None else "—")
+    table.add_row(
+        "Bucket",
+        f"top {metrics.bucket:,}" if metrics.bucket is not None else "—",
+    )
+    table.add_row("In top 1M", "yes" if metrics.listed else "no")
+    table.add_row("Best country rank", metrics.top_location or "—")
+    table.add_row("Source", metrics.source or "—")
+    if metrics.error:
+        table.add_row("Error", metrics.error)
+    console.print(table)
+    return 0 if not metrics.error else 1
+
+
+def cmd_semrush(args: argparse.Namespace) -> int:
     from pipeline.config import settings
     from pipeline.semrush import SemrushClient, root_domain
 
@@ -356,6 +402,16 @@ def build_parser() -> argparse.ArgumentParser:
         "auth",
         help="Sign in to Microsoft (device code / MFA) so Graph can send mail",
     )
+    p_auth.add_argument(
+        "--upload",
+        action="store_true",
+        help="Also copy this login to Key Vault for the Function App",
+    )
+    p_auth.add_argument(
+        "--vault-url",
+        default="",
+        help="Key Vault URL, e.g. https://kv-tlb-emo.vault.azure.net/",
+    )
     p_auth.set_defaults(func=cmd_auth)
 
     p_sent = sub.add_parser("sent", help="Show how many opportunities have been filed as sent")
@@ -402,17 +458,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_podcast.set_defaults(func=cmd_podcast)
 
-    p_site = sub.add_parser(
-        "site",
-        help="Look up Semrush visits and legitimacy for a domain or URL",
+    for name in ("site", "radar"):
+        p_radar = sub.add_parser(
+            name,
+            help="Look up Cloudflare Radar site traffic for a domain or URL",
+        )
+        p_radar.add_argument("target", help="Domain or URL, e.g. cio.com")
+        p_radar.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Return a stub rank instead of calling Cloudflare",
+        )
+        p_radar.set_defaults(func=cmd_radar)
+
+    p_semrush = sub.add_parser(
+        "semrush",
+        help="Look up Semrush visits and legitimacy (not used by the daily run)",
     )
-    p_site.add_argument("target", help="Domain or URL, e.g. cio.com")
-    p_site.add_argument(
+    p_semrush.add_argument("target", help="Domain or URL, e.g. cio.com")
+    p_semrush.add_argument(
         "--dry-run",
         action="store_true",
         help="Return stub metrics instead of calling Semrush",
     )
-    p_site.set_defaults(func=cmd_site)
+    p_semrush.set_defaults(func=cmd_semrush)
 
     return parser
 

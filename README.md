@@ -23,7 +23,7 @@ cp .env.example .env   # add ANTHROPIC_API_KEY, and optionally Cloudflare and Sp
 
 Optional: put real addresses in `config/emails.json` (the spreadsheet has no email column). Outbox delivery works without them.
 
-Claude is the research model. If that account is out of credits and `RESEARCH_FALLBACK=foundry`, the run continues on Azure AI Foundry (`FOUNDRY_ENDPOINT`, `FOUNDRY_API_KEY`, `FOUNDRY_MODEL`) using that API's web search tool. With no fallback configured, the roundup still sends. The top of the email names the model used. When Claude credits are exhausted it also includes error `anthropic_credit_balance`, asks the reader to contact their Claude administrator, and says to run the pipeline again after the balance is restored in the Anthropic admin console.
+Claude is the research model and is always tried first. If that API returns an error and `RESEARCH_FALLBACK=foundry`, the run continues on Azure AI Foundry (`FOUNDRY_ENDPOINT`, `FOUNDRY_API_KEY`, `FOUNDRY_MODEL`) using that API's web search tool, and the dashboard run line says so. With no fallback configured, the roundup still sends. The top of the email names the model used. When Claude credits are exhausted it also includes error `anthropic_credit_balance`, asks the reader to contact their Claude administrator, and says to run the pipeline again after the balance is restored in the Anthropic admin console.
 
 Add `CLOUDFLARE_API_TOKEN` (Account → Radar → Read) for a Site line from Cloudflare Radar. That rank comes from DNS queries to 1.1.1.1: an exact global rank for the top 100, otherwise a bucket such as top 10K, or “outside the top 1M.” It is a traffic-popularity rank, not an estimated visit count. Links on Spotify, YouTube, Apple, and similar hosts are skipped, because that rank would describe the platform. Without the token, the Site line is omitted and the roundup still sends.
 
@@ -118,7 +118,7 @@ Four things in the current code have to change before that works. The research a
 
 **Storage.** A Consumption function’s disk disappears when the run ends, so SQLite will not remember yesterday’s links or today’s “no.” The tables already in use — roster, sent links, Radar cache, podcast lookups, and feedback — map onto Azure Table Storage. `pipeline/storage.py` is the adapter to swap.
 
-**Mail login.** Today Graph sends as you, using a device-code sign-in saved in `data/msal_token_cache.bin`. A timer cannot show that prompt. Register an app permission to send as the mailbox (`Mail.Send` with admin consent) and call `/users/{mailbox}/sendMail` instead of `/me/sendMail`.
+**Mail login.** Graph sends as you through the **emof-agent** app registration, using a device-code sign-in saved in `data/msal_token_cache.bin`. A timer cannot show that prompt, so the Function App reads the same sign-in from Key Vault. Run `python -m pipeline auth --upload --vault-url https://kv-tlb-emo.vault.azure.net/` on your machine, then set `GRAPH_CLIENT_ID` to the emof-agent client ID, `GRAPH_TOKEN_VAULT_URL` to that vault, and leave `GRAPH_CLIENT_SECRET` unset. The Function App's identity needs Key Vault secret `get` and `set`, because Microsoft rotates the refresh token. Sign in and upload again after a password change, a session revoke, or about 90 days without a send.
 
 **How long the morning run is allowed to last.** Consumption functions stop at 10 minutes. One Claude web-search call per spokesperson can run past that for a full roster. Use a Premium plan with a longer timeout, or queue one message per person so each search is its own short function.
 

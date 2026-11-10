@@ -225,6 +225,9 @@ def _text_body(
         lines.append(_empty_day_line(notice))
         lines.append("")
 
+    if _has_radar(sections):
+        lines.append(_RADAR_NOTE)
+        lines.append("")
     if _has_site_metrics(sections):
         lines.append(
             "Site metrics: Semrush monthly visits and Authority Score. "
@@ -257,6 +260,8 @@ def _item_lines(opp: Opportunity, feedback_base: str) -> list[str]:
     else:
         lines.append(f"  Type: {opp.opportunity_type}")
     lines.append(f"  Link: {opp.url}")
+    if opp.radar and (rank := opp.radar.summary_line()):
+        lines.append(f"  {rank}")
     if opp.site:
         lines.append(f"  {opp.site.summary_line()}")
     if opp.podcast and (reach := opp.podcast.summary_line()):
@@ -333,6 +338,10 @@ def _html_body(
     if not time_sensitive and not other:
         chunks.append(f"<p>{escape(_empty_day_line(notice))}</p>")
 
+    if _has_radar(sections):
+        chunks.append(
+            f'<p style="font-size: 0.9em; color: #555;">{escape(_RADAR_NOTE)}</p>'
+        )
     if _has_site_metrics(sections):
         chunks.append(
             "<p style=\"font-size: 0.9em; color: #555;\">"
@@ -370,6 +379,8 @@ def _items_html(opportunities: list[Opportunity], feedback_base: str) -> str:
             else f"Type: {escape(opp.opportunity_type)}"
         )
         extra = ""
+        if opp.radar and (rank := opp.radar.summary_line()):
+            extra += f"<br>{escape(rank)}"
         if opp.site:
             extra += f"<br>{_site_html(opp)}"
         if opp.podcast and (reach := opp.podcast.summary_line()):
@@ -414,6 +425,23 @@ def _feedback_html(opp: Opportunity, feedback_base: str) -> str:
         "</td><td>"
         f'<a href="{linkedin}" style="{button}background:#0a66c2;">Make it LinkedIn</a>'
         "</td></tr></table>"
+    )
+
+
+_RADAR_NOTE = (
+    "Site: Cloudflare Radar rank from DNS queries to 1.1.1.1. "
+    "The global top 100 have an exact rank. Other ranked domains are a "
+    "bucket such as top 10K, and the rest are outside the top 1M. "
+    "This is a traffic-popularity rank, not an estimated visit count. "
+    "Links on Spotify, YouTube, Apple, and similar hosts are skipped."
+)
+
+
+def _has_radar(sections: list[PersonSection]) -> bool:
+    return any(
+        opp.radar and opp.radar.summary_line()
+        for s in sections
+        for opp in s.opportunities
     )
 
 

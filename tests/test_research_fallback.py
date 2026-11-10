@@ -8,8 +8,10 @@ import httpx
 
 from pipeline.config import settings
 from pipeline.fallback import fallback_research, foundry_responses_url, parse_foundry_output
-from pipeline.models import Spokesperson
-from pipeline.research import format_credit_code, is_claude_credit_error
+from pipeline.jobs import summarize
+from pipeline.models import ResearchResult, Spokesperson
+from pipeline.research import format_credit_code, is_claude_credit_error, research_person
+from pipeline.runner import PersonRunResult, PipelineResult
 from pipeline.roundup import PersonSection, ResearchNotice, build_roundup
 
 
@@ -113,6 +115,61 @@ def _assign_settings(**values: str) -> dict[str, str]:
 def _restore_settings(previous: dict[str, str]) -> None:
     for name, value in previous.items():
         object.__setattr__(settings, name, value)
+
+
+def test_claude_api_error_continues_on_foundry(monkeypatch) -> None:
+    previous = _assign_settings(research_fallback="foundry", anthropic_api_key="test-key")
+    calls = {"live": 0, "fallback": 0}
+
+    def live(*_args, **_kwargs):
+        calls["live"] += 1
+        raise RuntimeError("Error code: 500 - overloaded")
+
+    def fallback(person, _avoidance, _brief=""):
+        calls["fallback"] += 1
+        return ResearchResult(
+            person_id=person.person_id,
+            opportunities=[],
+            model_name="gpt-4o (Azure AI Foundry)",
+            provider="foundry",
+        )
+
+    monkeypatch.setattr("pipeline.research._run_live_research", live)
+    monkeypatch.setattr("pipeline.research._run_fallback", fallback)
+    person = Spokesperson.from_row(firm="TLB", name="Amy Kenly")
+    try:
+        result = research_person(person)
+    finally:
+        _restore_settings(previous)
+    assert calls == {"live": 1, "fallback": 1}
+    assert result.provider == "foundry"
+    assert result.claude_credit_code == ""
+
+
+def test_summary_names_foundry_fallback() -> None:
+    person = Spokesperson.from_row(firm="TLB", name="Amy Kenly")
+    result = PipelineResult(
+        results=[PersonRunResult(person=person, new=55)],
+        urgent=9,
+        delivered=False,
+        used_foundry=True,
+    )
+    assert summarize(result) == (
+        "Research finished with 55 new opportunities, but the roundup was not sent "
+        "(9 time-sensitive). Azure AI Foundry completed the research after "
+        "Claude returned an error."
+    )
+    result.used_foundry = False
+    assert summarize(result) == (
+        "Research finished with 55 new opportunities, but the roundup was not sent "
+        "(9 time-sensitive)."
+    )
+    result.delivered = True
+    result.used_foundry = True
+    assert summarize(result) == (
+        "Roundup sent with 55 new opportunities (9 time-sensitive). "
+        "Azure AI Foundry completed the research after Claude returned an error."
+    )
 
 
 def test_roundup_names_model_and_credit_error() -> None:

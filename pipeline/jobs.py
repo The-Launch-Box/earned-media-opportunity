@@ -181,4 +181,9 @@ def summarize(result: PipelineResult) -> str:
     if failed:
         noun = "speaker" if failed == 1 else "speakers"
         lead += f". {failed} {noun} could not be researched"
-    return lead + "."
+    lead += "."
+    if result.used_foundry:
+        lead += (
+            " Azure AI Foundry completed the research after Claude returned an error."
+        )
+    return lead

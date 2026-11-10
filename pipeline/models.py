@@ -121,6 +121,38 @@ class SiteMetrics(BaseModel):
         return f"Site: {self.visits_display()} · {self.legitimacy_display()}"
 
 
+class RadarMetrics(BaseModel):
+    """Cloudflare Radar traffic rank for the outlet's own site.
+
+    Radar ranks domains by DNS queries to 1.1.1.1. That is the site-traffic
+    signal in the roundup. The top 100 have an exact global rank. Everyone
+    else is a bucket (top 200, top 1K, … top 1M) or absent from the top million.
+    Radar does not publish an estimated visit count.
+    """
+
+    domain: str = ""
+    rank: int | None = None
+    bucket: int | None = None
+    listed: bool = False
+    top_location: str = ""
+    fetched_at: str = ""
+    error: str = ""
+    source: str = ""  # live | cache | stub
+
+    def summary_line(self) -> str:
+        if self.error:
+            return ""
+        # Country ranks are "where this domain places highest," often a small
+        # market, so the email keeps the global rank or bucket only.
+        if self.rank is not None:
+            return f"Site: Cloudflare Radar global rank #{self.rank}"
+        if self.bucket is not None:
+            return f"Site: Cloudflare Radar top {format_count(self.bucket)} domains"
+        if not self.listed:
+            return "Site: outside the Cloudflare Radar top 1M"
+        return ""
+
+
 class PodcastAudience(BaseModel):
     """Spotify catalog match, plus a Rephonic listener estimate when one exists."""
 
@@ -180,6 +212,7 @@ class Opportunity(BaseModel):
     urgent: bool = False
     fingerprint: str = ""
     site: SiteMetrics | None = None
+    radar: RadarMetrics | None = None
     podcast: PodcastAudience | None = None
     # Local-only link token for the action buttons in the roundup. Not from Claude.
     feedback_token: str = ""

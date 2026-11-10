@@ -1,4 +1,4 @@
-"""Azure AI Foundry research when Claude credits are exhausted.
+"""Azure AI Foundry research when the Claude API returns an error.
 
 The Responses API web_search tool retrieves live pages before the model answers.
 """

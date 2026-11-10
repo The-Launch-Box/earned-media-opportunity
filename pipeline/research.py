@@ -1,8 +1,9 @@
 """Claude web-search research for one spokesperson.
 
-When Claude reports that the credit balance is exhausted, research can continue
-on Azure AI Foundry if RESEARCH_FALLBACK=foundry. Other Claude errors stay on
-Claude and fail that person only.
+Claude is always tried first. If that API call returns an error and
+RESEARCH_FALLBACK=foundry, the same request continues on Azure AI Foundry.
+The rest of the run stays on Foundry. With no fallback configured, the error
+fails that person only.
 """
 
 from __future__ import annotations
@@ -130,6 +131,7 @@ def research_person(
     avoidance: str = "",
     brief: str = "",
     force_fallback: bool = False,
+    mark_credit: bool = False,
     credit_http_status: int | None = None,
 ) -> ResearchResult:
     use_dry = settings.dry_run_research or bool(dry_run)
@@ -137,11 +139,15 @@ def research_person(
         return _mock_research(person)
     if force_fallback:
         if not settings.research_fallback:
-            raise ClaudeCreditError(http_status=credit_http_status)
-        return _mark_credit(
-            _run_fallback(person, avoidance, brief),
-            http_status=credit_http_status,
-        )
+            if mark_credit:
+                raise ClaudeCreditError(http_status=credit_http_status)
+            raise RuntimeError(
+                "Claude is unavailable and RESEARCH_FALLBACK is not set."
+            )
+        result = _run_fallback(person, avoidance, brief)
+        if mark_credit:
+            return _mark_credit(result, http_status=credit_http_status)
+        return result
 
     if not settings.anthropic_api_key:
         if settings.research_fallback:
@@ -161,19 +167,7 @@ def research_person(
     except ClaudeCreditError:
         raise
     except Exception as exc:
-        if not is_claude_credit_error(exc):
-            raise
-        status = _credit_status(exc)
-        if not settings.research_fallback:
-            raise ClaudeCreditError(http_status=status) from exc
-        try:
-            result = _run_fallback(person, avoidance, brief)
-        except Exception as fallback_exc:
-            raise ClaudeCreditError(
-                http_status=status,
-                fallback_detail=str(fallback_exc),
-            ) from fallback_exc
-        return _mark_credit(result, http_status=status)
+        return _continue_on_fallback(person, avoidance, brief, exc)
 
     parsed = _parse_json_payload(_extract_text(response))
     opportunities = [_to_opportunity(item) for item in parsed.get("opportunities", [])]
@@ -186,6 +180,35 @@ def research_person(
         model_name=settings.claude_model,
         provider="claude",
     )
+
+
+def _continue_on_fallback(
+    person: Spokesperson,
+    avoidance: str,
+    brief: str,
+    exc: BaseException,
+) -> ResearchResult:
+    """Run Foundry after Claude's API call failed. Re-raise when it cannot."""
+    status = _credit_status(exc)
+    credit = is_claude_credit_error(exc)
+    if not settings.research_fallback:
+        if credit:
+            raise ClaudeCreditError(http_status=status) from exc
+        raise exc
+    try:
+        result = _run_fallback(person, avoidance, brief)
+    except Exception as fallback_exc:
+        if credit:
+            raise ClaudeCreditError(
+                http_status=status,
+                fallback_detail=str(fallback_exc),
+            ) from fallback_exc
+        raise RuntimeError(
+            f"Claude failed ({exc}). Foundry fallback failed: {fallback_exc}"
+        ) from fallback_exc
+    if credit:
+        return _mark_credit(result, http_status=status)
+    return result
 
 
 def _run_fallback(person: Spokesperson, avoidance: str, brief: str = "") -> ResearchResult:

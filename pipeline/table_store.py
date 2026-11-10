@@ -11,8 +11,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pipeline.config import settings
-from pipeline.models import Opportunity, PodcastAudience, SiteMetrics, Spokesperson
-from pipeline.storage import ActionJob, FeedbackRecord
+from pipeline.models import (
+    Opportunity,
+    PodcastAudience,
+    RadarMetrics,
+    SiteMetrics,
+    Spokesperson,
+)
+from pipeline.storage import ActionJob, FeedbackRecord, _fresh_payload
 
 _BATCH_KEY = re.compile(r"^emo-[0-9a-f]{8}$")
 _STALE_AFTER = timedelta(minutes=30)
@@ -79,6 +85,7 @@ class TableStore:
         self._roster = service.create_table_if_not_exists(table("Roster"))
         self._sent = service.create_table_if_not_exists(table("SentOpportunities"))
         self._semrush = service.create_table_if_not_exists(table("SemrushDomains"))
+        self._radar = service.create_table_if_not_exists(table("RadarDomains"))
         self._podcasts = service.create_table_if_not_exists(table("PodcastShows"))
         self._feedback = service.create_table_if_not_exists(table("OpportunityFeedback"))
         self._batches = service.create_table_if_not_exists(table("RoundupBatches"))
@@ -273,6 +280,40 @@ class TableStore:
             mode=_replace(),
         )
 
+    def get_radar_cache(
+        self,
+        domain: str,
+        max_age_days: int,
+        *,
+        now: datetime | None = None,
+    ) -> RadarMetrics | None:
+        try:
+            row = self._radar.get_entity("domain", domain)
+        except _not_found():
+            return None
+        data = _fresh_payload(
+            _text(row.get("payload")),
+            _text(row.get("fetched_at")),
+            max_age_days,
+            now=now,
+        )
+        return RadarMetrics.model_validate(data) if data is not None else None
+
+    def put_radar_cache(self, metrics: RadarMetrics) -> None:
+        domain = (metrics.domain or "").strip().lower()
+        if not domain:
+            return
+        fetched_at = metrics.fetched_at or datetime.now(timezone.utc).isoformat()
+        self._radar.upsert_entity(
+            {
+                "PartitionKey": "domain",
+                "RowKey": domain,
+                "payload": metrics.model_dump_json(),
+                "fetched_at": fetched_at,
+            },
+            mode=_replace(),
+        )
+
     def get_podcast_cache(
         self,
         query: str,
@@ -323,6 +364,7 @@ class TableStore:
                 "roster": [_plain(entity) for entity in self._roster.list_entities()],
                 "sent": [_plain(entity) for entity in self._sent.list_entities()],
                 "semrush": [_plain(entity) for entity in self._semrush.list_entities()],
+                "radar": [_plain(entity) for entity in self._radar.list_entities()],
                 "podcasts": [_plain(entity) for entity in self._podcasts.list_entities()],
                 "feedback": [
                     _plain(entity) for entity in self._feedback.list_entities()

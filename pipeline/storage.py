@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Iterator
 
 from pipeline.config import settings
-from pipeline.models import Opportunity, PodcastAudience, SiteMetrics, Spokesperson
+from pipeline.models import (
+    Opportunity,
+    PodcastAudience,
+    RadarMetrics,
+    SiteMetrics,
+    Spokesperson,
+)
 
 
 SCHEMA = """
@@ -45,6 +51,12 @@ CREATE INDEX IF NOT EXISTS idx_sent_person ON sent_opportunities(person_id);
 CREATE INDEX IF NOT EXISTS idx_sent_fingerprint ON sent_opportunities(fingerprint);
 
 CREATE TABLE IF NOT EXISTS semrush_domains (
+    domain     TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS radar_domains (
     domain     TEXT PRIMARY KEY,
     payload    TEXT NOT NULL,
     fetched_at TEXT NOT NULL
@@ -429,6 +441,41 @@ class LocalStore:
                 (domain, metrics.model_dump_json(), fetched_at),
             )
 
+    def get_radar_cache(
+        self,
+        domain: str,
+        max_age_days: int,
+        *,
+        now: datetime | None = None,
+    ) -> RadarMetrics | None:
+        """Return a still-fresh Radar ranking, or None if missing/stale."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT payload, fetched_at FROM radar_domains WHERE domain = ?",
+                (domain,),
+            ).fetchone()
+        if row is None:
+            return None
+        data = _fresh_payload(row["payload"], row["fetched_at"], max_age_days, now=now)
+        return RadarMetrics.model_validate(data) if data is not None else None
+
+    def put_radar_cache(self, metrics: RadarMetrics) -> None:
+        domain = (metrics.domain or "").strip().lower()
+        if not domain:
+            return
+        fetched_at = metrics.fetched_at or datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO radar_domains (domain, payload, fetched_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(domain) DO UPDATE SET
+                    payload = excluded.payload,
+                    fetched_at = excluded.fetched_at
+                """,
+                (domain, metrics.model_dump_json(), fetched_at),
+            )
+
     def get_podcast_cache(
         self,
         query: str,
@@ -470,6 +517,9 @@ class LocalStore:
             semrush = [
                 dict(r) for r in conn.execute("SELECT * FROM semrush_domains")
             ]
+            radar = [
+                dict(r) for r in conn.execute("SELECT * FROM radar_domains")
+            ]
             podcasts = [
                 dict(r) for r in conn.execute("SELECT * FROM podcast_shows")
             ]
@@ -481,6 +531,7 @@ class LocalStore:
                 "roster": roster,
                 "sent": sent,
                 "semrush": semrush,
+                "radar": radar,
                 "podcasts": podcasts,
                 "feedback": feedback,
             },
@@ -822,6 +873,30 @@ def _cached_podcast(
     if not isinstance(data, dict):
         return None
     return PodcastAudience.model_validate(data)
+
+
+def _fresh_payload(
+    payload: str | None,
+    fetched_at: str | None,
+    max_age_days: int,
+    *,
+    now: datetime | None = None,
+) -> dict | None:
+    """Decoded JSON cache payload, or None when it is stale or unreadable."""
+    try:
+        fetched = datetime.fromisoformat(fetched_at or "")
+    except ValueError:
+        return None
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=timezone.utc)
+    age = (now or datetime.now(timezone.utc)) - fetched
+    if age.days > max_age_days:
+        return None
+    try:
+        data = json.loads(payload or "")
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def open_store() -> LocalStore:

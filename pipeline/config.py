@@ -20,7 +20,7 @@ class Settings:
 
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     claude_model: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-    # foundry | empty. Used when Claude credits are exhausted.
+    # foundry | empty. Used when the Claude API returns an error.
     research_fallback: str = os.getenv("RESEARCH_FALLBACK", "").strip().lower()
     foundry_endpoint: str = os.getenv("FOUNDRY_ENDPOINT", "").strip().rstrip("/")
     foundry_api_key: str = os.getenv("FOUNDRY_API_KEY", "").strip()
@@ -41,6 +41,9 @@ class Settings:
         os.getenv("GRAPH_CLIENT_SECRET") or os.getenv("AZURE_CLIENT_SECRET", "")
     )
     msal_cache_path: Path = ROOT / "data" / "msal_token_cache.bin"
+    # Set on the Function App: the delegated sign-in cache lives in Key Vault, not on disk.
+    graph_token_vault_url: str = os.getenv("GRAPH_TOKEN_VAULT_URL", "").strip()
+    graph_token_secret: str = os.getenv("GRAPH_TOKEN_SECRET", "graph-token-cache").strip()
     # sqlite (local) or tables (Azure Table Storage)
     storage_backend: str = os.getenv("STORAGE_BACKEND", "sqlite").strip().lower()
     azure_storage_account: str = os.getenv("AZURE_STORAGE_ACCOUNT", "").strip()
@@ -58,6 +61,10 @@ class Settings:
     semrush_use_traffic_analytics: bool = os.getenv(
         "SEMRUSH_USE_TRAFFIC_ANALYTICS", "true"
     ).lower() in {"1", "true", "yes"}
+
+    # Cloudflare Radar site-traffic rank. Token needs Account → Radar → Read.
+    cloudflare_api_token: str = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+    radar_cache_days: int = int(os.getenv("RADAR_CACHE_DAYS", "7") or "7")
 
     # Podcast reach: Spotify confirms the show; Rephonic supplies the estimate.
     spotify_client_id: str = os.getenv("SPOTIFY_CLIENT_ID", "").strip()

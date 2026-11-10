@@ -154,6 +154,17 @@ def _write_outbox(
                     for o in roundup.opportunities
                     if o.site
                 ],
+                "radar": [
+                    {
+                        "url": o.url,
+                        "domain": o.radar.domain,
+                        "rank": o.radar.rank,
+                        "bucket": o.radar.bucket,
+                        "listed": o.radar.listed,
+                    }
+                    for o in roundup.opportunities
+                    if o.radar
+                ],
                 "generated_on": roundup.generated_on,
                 "batch_key": roundup.batch_key,
                 "items": [

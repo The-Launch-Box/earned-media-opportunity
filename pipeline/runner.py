@@ -15,7 +15,7 @@ from pipeline.research import ClaudeCreditError, format_credit_code, research_pe
 from pipeline.roundup import PersonSection, ResearchNotice, build_roundup
 from pipeline.roster import load_roster_from_xlsx
 from pipeline.podcasts import enrich_podcasts
-from pipeline.semrush import enrich_opportunities
+from pipeline.radar import enrich_opportunities as enrich_radar
 from pipeline.storage import LocalStore, open_store
 
 console = Console()
@@ -39,6 +39,7 @@ class PipelineResult:
     outbox_path: str | None = None
     urgent: int = 0
     skipped_empty: bool = False
+    used_foundry: bool = False
 
     @property
     def errors(self) -> list[PersonRunResult]:
@@ -64,7 +65,7 @@ def run_daily(
     One morning's work:
       1. Sync roster from Excel (new names are flagged, then researched)
       2. For each person: Claude research → dedupe against sent_opportunities
-      3. Score remaining outlets with Semrush (visits + legitimacy)
+      3. Rank remaining outlets with Cloudflare Radar (site traffic rank)
       4. Build one Time-Sensitive / Other blast
       5. Deliver once, then record newly sent fingerprints
     """
@@ -186,6 +187,7 @@ def _execute_run(
     credit_code = ""
     credit_status: int | None = None
     completed = 0
+    claude_down = False
     use_fallback = bool(settings.research_fallback) and not dry_run
 
     for person in people:
@@ -210,20 +212,30 @@ def _execute_run(
                 dry_run=dry_run,
                 avoidance=avoidance,
                 brief=brief,
-                force_fallback=bool(credit_code) and use_fallback,
+                force_fallback=claude_down and use_fallback,
+                mark_credit=bool(credit_code),
                 credit_http_status=credit_status,
             )
+            if research.provider == "foundry":
+                outcome.used_foundry = True
             if research.model_name and research.model_name not in models:
                 models.append(research.model_name)
                 if research.provider not in {"", "claude", "dry-run"}:
                     console.print(f"  research model: {research.model_name}")
-            if research.claude_credit_code and not credit_code:
-                credit_code = research.claude_credit_code
-                credit_status = research.claude_credit_http_status
-                console.print(
-                    f"  [yellow]Claude credits are exhausted (error {credit_code}). "
-                    f"Continuing on {research.model_name}.[/]"
-                )
+            if research.provider == "foundry" and not claude_down:
+                claude_down = True
+                if research.claude_credit_code:
+                    credit_code = research.claude_credit_code
+                    credit_status = research.claude_credit_http_status
+                    console.print(
+                        f"  [yellow]Claude credits are exhausted (error {credit_code}). "
+                        f"Continuing on {research.model_name}.[/]"
+                    )
+                else:
+                    console.print(
+                        "  [yellow]Claude returned an error. "
+                        f"Continuing on {research.model_name}.[/]"
+                    )
             completed += 1
             result.found = len(research.opportunities)
             fresh = store.filter_new(person.person_id, research.opportunities)
@@ -254,16 +266,19 @@ def _execute_run(
         except ClaudeCreditError as exc:
             credit_code = format_credit_code(exc.code, exc.http_status)
             credit_status = exc.http_status
+            claude_down = True
             result.error = str(exc)
             console.print(f"  [red]error:[/] {exc}")
         except Exception as exc:  # noqa: BLE001 — keep the run going for others
+            if use_fallback and _claude_call_failed(exc):
+                claude_down = True
             result.error = str(exc)
             console.print(f"  [red]error:[/] {exc}")
 
         outcome.results.append(result)
 
     if sections:
-        _attach_semrush(sections, store=store, dry_run=dry_run)
+        _attach_radar(sections, store=store, dry_run=dry_run)
         _attach_podcasts(sections, store=store, dry_run=dry_run)
         for section in sections:
             store.issue_feedback(section.person, section.opportunities)
@@ -329,20 +344,26 @@ def _execute_run(
     return outcome
 
 
-def _attach_semrush(
+def _claude_call_failed(exc: BaseException) -> bool:
+    """True when Claude's API call failed and Foundry could not finish it."""
+    text = str(exc)
+    return text.startswith("Claude failed (") or text.startswith("Claude is unavailable")
+
+
+def _attach_radar(
     sections: list[PersonSection],
     *,
     store: LocalStore,
     dry_run: bool,
 ) -> None:
-    """Score unique outlet domains once per run and stamp each opportunity."""
+    """Rank unique outlet domains once per run. Platform hosts are skipped."""
     flat = [opp for section in sections for opp in section.opportunities]
     if not flat:
         return
     try:
-        enriched, stats = enrich_opportunities(flat, dry_run=dry_run, store=store)
+        enriched, stats = enrich_radar(flat, dry_run=dry_run, store=store)
     except Exception as exc:  # noqa: BLE001 — roundup still goes out
-        console.print(f"[yellow]Semrush skipped:[/] {exc}")
+        console.print(f"[yellow]Site traffic skipped:[/] {exc}")
         return
 
     by_fp = {opp.fingerprint: opp for opp in enriched if opp.fingerprint}
@@ -352,15 +373,17 @@ def _attach_semrush(
         ]
 
     if stats.skipped and stats.fetched == 0 and stats.cached == 0:
-        console.print(f"[yellow]Semrush skipped:[/] {stats.skipped}")
+        console.print(f"[yellow]Site traffic skipped:[/] {stats.skipped}")
         return
     if not stats.domains:
         return
     detail = f"{stats.cached} cache, {stats.fetched} live"
+    if stats.unlisted:
+        detail += f", {stats.unlisted} outside top 1M"
     if stats.failed:
         detail += f", {stats.failed} failed"
     console.print(
-        f"Semrush: {stats.domains} unique domain"
+        f"Site traffic (Cloudflare Radar): {stats.domains} unique domain"
         f"{'s' if stats.domains != 1 else ''} ({detail})"
     )
     if stats.skipped:

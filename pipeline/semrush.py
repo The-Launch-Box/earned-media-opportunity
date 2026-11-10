@@ -1,4 +1,8 @@
-"""Score opportunity outlets with Semrush traffic and Authority Score."""
+"""Score opportunity outlets with Semrush traffic and Authority Score.
+
+The daily run does not call this module; its Site line comes from
+pipeline.radar. `python -m pipeline semrush <domain>` still uses it.
+"""
 
 from __future__ import annotations
 
