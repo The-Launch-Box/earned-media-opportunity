@@ -584,6 +584,64 @@ class LocalStore:
                 )
                 opp.feedback_token = token
 
+    def ensure_feedback_row(self, record: FeedbackRecord) -> bool:
+        """Insert this token when it is not already stored. Keep an existing decision."""
+        token = (record.token or "").strip()
+        if not token:
+            return False
+        with self._conn() as conn:
+            found = conn.execute(
+                "SELECT token FROM opportunity_feedback WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if found:
+                return False
+            conn.execute(
+                """
+                INSERT INTO opportunity_feedback
+                (token, person_id, person_name, fingerprint, url, title,
+                 outlet, opportunity_type, why_relevant, suggested_angle,
+                 verdict, reason, created_at, decided_at, batch_key, item_number)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    record.person_id,
+                    record.person_name,
+                    record.fingerprint,
+                    record.url,
+                    record.title,
+                    record.outlet,
+                    record.opportunity_type,
+                    record.why_relevant,
+                    record.suggested_angle,
+                    record.verdict or None,
+                    record.reason or "",
+                    record.created_at or datetime.now(timezone.utc).isoformat(),
+                    record.decided_at or None,
+                    record.batch_key or None,
+                    record.item_number or None,
+                ),
+            )
+        return True
+
+    def list_feedback(self) -> list[FeedbackRecord]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM opportunity_feedback ORDER BY created_at"
+            ).fetchall()
+        return [_feedback_from_row(row) for row in rows]
+
+    def list_batches(self) -> list[tuple[str, str, str]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT batch_key, subject, reply_to FROM roundup_batches"
+            ).fetchall()
+        return [
+            (row["batch_key"], row["subject"] or "", row["reply_to"] or "")
+            for row in rows
+        ]
+
     def get_feedback(self, token: str) -> FeedbackRecord | None:
         with self._conn() as conn:
             row = conn.execute(

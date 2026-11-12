@@ -58,10 +58,14 @@ class TableStore:
         self.db_path = Path(f"https://{account_name}.table.core.windows.net")
         connection = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
         platform = (settings.azure_storage_account or "").strip()
+        connection_account = _connection_account(connection)
         # A dedicated per-company account is opened with the managed identity.
         # The shared platform account, including per-company tables on it,
         # uses the connection string the Function App already has.
-        dedicated = bool((account or "").strip()) and account_name != platform
+        dedicated = (
+            bool((account or "").strip())
+            and account_name not in {platform, connection_account}
+        )
         if dedicated:
             from azure.identity import DefaultAzureCredential
 
@@ -406,6 +410,22 @@ class TableStore:
             )
             opp.feedback_token = token
 
+    def ensure_feedback_row(self, record: FeedbackRecord) -> bool:
+        """Insert this token when the public site does not have it yet.
+
+        An existing row is left alone, including a decision already saved there.
+        """
+        token = (record.token or "").strip()
+        if not token:
+            return False
+        try:
+            self._feedback.get_entity("feedback", token)
+            return False
+        except _not_found():
+            pass
+        self._feedback.create_entity(_feedback_entity(record))
+        return True
+
     def get_feedback(self, token: str) -> FeedbackRecord | None:
         try:
             row = self._feedback.get_entity("feedback", token)
@@ -694,6 +714,36 @@ def _spokesperson(entity: dict) -> Spokesperson:
         bio=_text(entity.get("bio")),
         email=email or None,
     )
+
+
+def _connection_account(connection: str) -> str:
+    for part in connection.split(";"):
+        name, _, value = part.partition("=")
+        if name.strip().lower() == "accountname":
+            return value.strip()
+    return ""
+
+
+def _feedback_entity(record: FeedbackRecord) -> dict:
+    return {
+        "PartitionKey": "feedback",
+        "RowKey": record.token,
+        "person_id": record.person_id,
+        "person_name": record.person_name,
+        "fingerprint": record.fingerprint,
+        "url": record.url,
+        "title": record.title,
+        "outlet": record.outlet,
+        "opportunity_type": record.opportunity_type,
+        "why_relevant": record.why_relevant,
+        "suggested_angle": record.suggested_angle,
+        "verdict": record.verdict or "",
+        "reason": record.reason or "",
+        "created_at": record.created_at or datetime.now(timezone.utc).isoformat(),
+        "decided_at": record.decided_at or "",
+        "batch_key": record.batch_key or "",
+        "item_number": int(record.item_number or 0),
+    }
 
 
 def _feedback_from_entity(entity: dict) -> FeedbackRecord:

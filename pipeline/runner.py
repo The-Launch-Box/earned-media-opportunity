@@ -304,14 +304,15 @@ def _execute_run(
             research_incomplete=bool(credit_code) and completed == 0,
         ),
     )
+    reply_to = settings.blast_to if blast_to is None else (blast_to or "")
     if roundup.batch_key:
-        reply_to = settings.blast_to if blast_to is None else (blast_to or "")
         store.save_batch(
             roundup.batch_key,
             roundup.subject,
             reply_to,
             roundup.opportunities,
         )
+    _publish_links(store, sections, roundup, reply_to)
     delivery = deliver(
         roundup,
         blast_to=blast_to,
@@ -344,6 +345,24 @@ def _execute_run(
     return outcome
 
 
+def _publish_links(store: LocalStore, sections: list[PersonSection], roundup, reply_to: str) -> None:
+    """Put the email's tokens where the public site looks them up."""
+    if not sections:
+        return
+    from pipeline.feedback_publish import publish_public_feedback
+
+    try:
+        added = publish_public_feedback(store, sections, roundup, reply_to=reply_to)
+    except Exception as exc:  # noqa: BLE001 — the roundup still sends
+        console.print(f"[yellow]Action links were not published to the public site:[/] {exc}")
+        return
+    if added:
+        console.print(
+            f"  published {added} action link"
+            f"{'s' if added != 1 else ''} to the public site"
+        )
+
+
 def _claude_call_failed(exc: BaseException) -> bool:
     """True when Claude's API call failed and Foundry could not finish it."""
     text = str(exc)
@@ -356,7 +375,11 @@ def _attach_radar(
     store: LocalStore,
     dry_run: bool,
 ) -> None:
-    """Rank unique outlet domains once per run. Platform hosts are skipped."""
+    """Rank outlet domains once per run, whether Claude or Foundry found them.
+
+    Platform hosts are skipped. A missing Cloudflare token omits the Site line
+    and does not stop the email.
+    """
     flat = [opp for section in sections for opp in section.opportunities]
     if not flat:
         return

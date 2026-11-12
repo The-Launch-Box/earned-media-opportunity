@@ -169,3 +169,73 @@ def test_daily_run_uses_radar_not_semrush() -> None:
 
     assert runner.enrich_radar is enrich_radar
     assert not hasattr(runner, "_attach_semrush")
+
+
+def test_foundry_fallback_still_ranks_with_radar(monkeypatch, tmp_path) -> None:
+    """Foundry replaces Claude. Site rank still comes from Cloudflare Radar."""
+    import pipeline.runner as runner
+    from pipeline.models import ResearchResult
+    from pipeline.radar import RadarStats
+    from pipeline.storage import LocalStore
+
+    store = LocalStore(tmp_path / "pipeline.db")
+    person = Spokesperson.from_row(firm="TLB", name="Amy Kenly", title="CMO", topics="B2B")
+    opp = Opportunity(
+        title="Guest post",
+        url="https://www.cio.com/contribute",
+        outlet="CIO.com",
+        opportunity_type="backlink",
+    )
+
+    def research_person(who, **kwargs):
+        del kwargs
+        return ResearchResult(
+            person_id=who.person_id,
+            opportunities=[opp.model_copy()],
+            provider="foundry",
+            model_name="gpt-4o (Azure AI Foundry)",
+        )
+
+    ranked: list[Opportunity] = []
+
+    def enrich(opportunities, **kwargs):
+        del kwargs
+        ranked.extend(opportunities)
+        stamped = [
+            item.model_copy(
+                update={"radar": RadarMetrics(domain="cio.com", bucket=10_000, listed=True)}
+            )
+            for item in opportunities
+        ]
+        return stamped, RadarStats(domains=len(stamped), fetched=len(stamped))
+
+    class _Quiet:
+        skipped = ""
+        fetched = 0
+        cached = 0
+        checked = 0
+        matched = 0
+        failed = 0
+
+    class _Delivery:
+        mode = "none"
+        mailed = False
+        skipped = True
+        path = None
+
+    monkeypatch.setattr(runner, "research_person", research_person)
+    monkeypatch.setattr(runner, "enrich_radar", enrich)
+    monkeypatch.setattr(runner, "enrich_podcasts", lambda opportunities, **kwargs: (opportunities, _Quiet()))
+    monkeypatch.setattr(runner, "deliver", lambda *args, **kwargs: _Delivery())
+    monkeypatch.setattr(runner, "_publish_links", lambda *args, **kwargs: None)
+
+    result = runner._execute_run(
+        store,
+        [person],
+        newcomers=[],
+        synced=1,
+        dry_run=False,
+        skip_empty=False,
+    )
+    assert result.used_foundry
+    assert ranked and ranked[0].url == opp.url
