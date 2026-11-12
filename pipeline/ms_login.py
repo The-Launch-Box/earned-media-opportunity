@@ -11,6 +11,10 @@ import os
 
 AUTHORITY = "https://login.microsoftonline.com/organizations"
 SCOPES = ["User.Read"]
+# prompt=none comes back with one of these when Microsoft has nothing to reuse.
+SILENT_FAILURES = frozenset(
+    {"login_required", "interaction_required", "consent_required"}
+)
 
 
 def microsoft_configured() -> bool:
@@ -29,11 +33,40 @@ def redirect_uri() -> str:
     return public.rstrip("/") + "/auth/callback"
 
 
-def begin_flow() -> dict:
-    flow = _app().initiate_auth_code_flow(scopes=SCOPES, redirect_uri=redirect_uri())
+def begin_flow(
+    *,
+    prompt: str | None = None,
+    login_hint: str | None = None,
+) -> dict:
+    """Start Microsoft sign-in.
+
+    prompt="none" reuses the browser's existing work session and does not
+    show the account page. The caller falls back to a normal sign-in when
+    Microsoft returns a code in SILENT_FAILURES.
+    """
+    kwargs: dict[str, str] = {}
+    if prompt:
+        kwargs["prompt"] = prompt
+    hint = clean_login_hint(login_hint)
+    if hint:
+        kwargs["login_hint"] = hint
+    elif prompt == "none":
+        kwargs["domain_hint"] = "organizations"
+    flow = _app().initiate_auth_code_flow(
+        scopes=SCOPES,
+        redirect_uri=redirect_uri(),
+        **kwargs,
+    )
     if "error" in flow:
         raise RuntimeError(flow.get("error_description") or flow["error"])
     return flow
+
+
+def clean_login_hint(value: str | None) -> str | None:
+    hint = (value or "").strip()
+    if not hint or len(hint) > 256 or any(char in hint for char in "\r\n"):
+        return None
+    return hint
 
 
 def finish_flow(flow: dict, query: dict[str, str]) -> dict[str, str]:

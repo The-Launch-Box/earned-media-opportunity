@@ -14,7 +14,13 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from pipeline.jobs import RunInProgress, enqueue_run
 from pipeline.models import Spokesperson
-from pipeline.ms_login import begin_flow, finish_flow, microsoft_configured, redirect_uri
+from pipeline.ms_login import (
+    SILENT_FAILURES,
+    begin_flow,
+    finish_flow,
+    microsoft_configured,
+    redirect_uri,
+)
 from pipeline.provision import open_tenant_store, provision_tenant
 from pipeline.registry import (
     AccessDenied,
@@ -183,6 +189,10 @@ def _dispatch(method: str, target: str, headers: dict, body: bytes) -> HttpResul
     session = _session(headers)
     if session is None:
         if path == "/" and method == "GET":
+            # Someone arriving from the portal already has a Microsoft session.
+            # Ask for it with no screen, and show the button only if that fails.
+            if microsoft_configured():
+                return _microsoft_redirect(silent=True)
             return _login_page()
         return _redirect("/login")
     email = str(session.get("email") or "")
@@ -249,24 +259,36 @@ def _login(method: str, form: dict[str, str], next_path: str = "") -> HttpResult
     return HttpResult(403, _document("Sign-in", "<h1>Sign-in isn't available</h1>"))
 
 
-def _microsoft_redirect(next_path: str = "") -> HttpResult:
+def _microsoft_redirect(
+    next_path: str = "",
+    *,
+    silent: bool = False,
+) -> HttpResult:
     registry = default_registry()
-    flow = begin_flow()
+    flow = begin_flow(prompt="none") if silent else begin_flow()
     auth_uri = str(flow.get("auth_uri") or "")
     if not auth_uri.startswith("https://login.microsoftonline.com/"):
         raise RuntimeError("Unexpected Microsoft sign-in address.")
     state = str(flow.get("state") or "")
     if not state:
         raise RuntimeError("Microsoft didn't return a sign-in state.")
+    if silent:
+        # Removed before the token exchange. It only tells the callback that
+        # a missing Microsoft session should show the existing sign-in page.
+        flow["_emo_silent"] = True
     registry.save_oauth(state, flow, _safe_next(next_path))
     return _redirect(auth_uri)
 
 
 def _callback(query: dict[str, str]) -> HttpResult:
-    if query.get("error"):
-        return _login_page(error="Microsoft didn't complete sign-in. Try again.")
     state = query.get("state", "")
-    flow = default_registry().pop_oauth(state)
+    flow = default_registry().pop_oauth(state) if state else None
+    silent = bool(flow.pop("_emo_silent", False)) if isinstance(flow, dict) else False
+    error = query.get("error") or ""
+    if error:
+        if silent and error in SILENT_FAILURES:
+            return _login_page()
+        return _login_page(error="Microsoft didn't complete sign-in. Try again.")
     if flow is None:
         return _login_page(error=_NOTICES["signin"])
     next_path = str(flow.pop("_emo_next", "") or "")
