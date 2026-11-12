@@ -7,7 +7,13 @@ from datetime import date
 import httpx
 
 from pipeline.config import settings
-from pipeline.fallback import fallback_research, foundry_responses_url, parse_foundry_output
+from pipeline.fallback import (
+    fallback_research,
+    foundry_messages_url,
+    foundry_responses_url,
+    parse_foundry_messages,
+    parse_foundry_output,
+)
 from pipeline.jobs import summarize
 from pipeline.models import ResearchResult, Spokesperson
 from pipeline.research import format_credit_code, is_claude_credit_error, research_person
@@ -53,6 +59,87 @@ def test_foundry_url_and_output() -> None:
     )
     assert searches == 1
     assert "One hit." in text
+
+
+def test_foundry_claude_url_and_messages() -> None:
+    assert foundry_messages_url("https://example.services.ai.azure.com") == (
+        "https://example.services.ai.azure.com/anthropic/v1/messages"
+    )
+    assert foundry_messages_url(
+        "https://example.cognitiveservices.azure.com/"
+    ) == "https://example.services.ai.azure.com/anthropic/v1/messages"
+    text, searches = parse_foundry_messages(
+        {
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "server_tool_use", "name": "web_search"},
+                {"type": "text", "text": '{"summary": "One hit.", "opportunities": []}'},
+            ],
+            "usage": {"server_tool_use": {"web_search_requests": 2}},
+        }
+    )
+    assert searches == 2
+    assert "One hit." in text
+
+
+def test_foundry_claude_fallback_reads_show_json() -> None:
+    previous = _assign_settings(
+        research_fallback="foundry",
+        foundry_endpoint="https://example.services.ai.azure.com",
+        foundry_api_key="key",
+        foundry_model="claude-sonnet-4-6",
+    )
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        assert request.url.path == "/anthropic/v1/messages"
+        assert request.headers["x-api-key"] == "key"
+        assert request.headers["anthropic-version"] == "2023-06-01"
+        body = request.read()
+        assert b"web_search_20250305" in body
+        assert b"claude-sonnet-4-6" in body
+        if calls["n"] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "stop_reason": "pause_turn",
+                    "content": [{"type": "server_tool_use", "name": "web_search", "id": "s1"}],
+                    "usage": {"server_tool_use": {"web_search_requests": 1}},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "stop_reason": "end_turn",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            '{"summary": "Found one.", "opportunities": ['
+                            '{"title": "Guest call", "url": "https://example.com/call",'
+                            '"outlet": "Trade Weekly", "opportunity_type": "press",'
+                            '"why_relevant": "Fits.", "suggested_angle": "Pitch it.",'
+                            '"deadline": null, "urgent": false}]}'
+                        ),
+                    }
+                ],
+                "usage": {"server_tool_use": {"web_search_requests": 1}},
+            },
+        )
+
+    person = Spokesperson.from_row(firm="TLB", name="Amy Kenly", topics="pricing")
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        result = fallback_research(person, http=http)
+    finally:
+        http.close()
+        _restore_settings(previous)
+    assert calls["n"] == 2
+    assert result.provider == "foundry"
+    assert result.model_name == "claude-sonnet-4-6 (Azure AI Foundry)"
+    assert result.search_count == 2
+    assert result.opportunities[0].url == "https://example.com/call"
 
 
 def test_foundry_fallback_reads_show_json() -> None:
