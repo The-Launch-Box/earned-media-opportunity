@@ -131,3 +131,27 @@ def test_begin_flow_sends_prompt_none_for_a_work_account(monkeypatch) -> None:
     assert "prompt" not in plain
     assert clean_login_hint("  kaylee@thelaunchbox.com ") == "kaylee@thelaunchbox.com"
     assert clean_login_hint("bad\nhint") is None
+
+
+def test_portal_tile_on_the_callback_goes_to_home(monkeypatch) -> None:
+    # The portal tile links to /auth/callback with nothing from Microsoft.
+    registry = _Registry()
+    captured: dict = {}
+    _install(monkeypatch, registry, captured)
+
+    result = handle_request("GET", "/auth/callback", {}, b"")
+
+    assert result.status == 303
+    assert ("Location", "/") in result.headers
+    assert registry.saved is None
+
+
+def test_expired_state_still_says_sign_in_expired(monkeypatch) -> None:
+    registry = _Registry()
+    captured: dict = {}
+    _install(monkeypatch, registry, captured)
+
+    result = handle_request("GET", "/auth/callback?state=gone&code=abc", {}, b"")
+
+    assert result.status == 403
+    assert "Sign-in expired" in result.body

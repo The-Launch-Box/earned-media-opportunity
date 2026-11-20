@@ -281,6 +281,11 @@ def _microsoft_redirect(
 
 
 def _callback(query: dict[str, str]) -> HttpResult:
+    if not any(query.get(key) for key in ("state", "code", "error")):
+        # The portal tile opens /auth/callback directly. Nothing came back from
+        # Microsoft, so treat it as opening the site: the home page shows the
+        # dashboard to a signed-in user and tries silent sign-in otherwise.
+        return _redirect("/")
     state = query.get("state", "")
     flow = default_registry().pop_oauth(state) if state else None
     silent = bool(flow.pop("_emo_silent", False)) if isinstance(flow, dict) else False
