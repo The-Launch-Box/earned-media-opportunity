@@ -25,6 +25,7 @@ A company run from the dashboard uses the same research path as the morning job.
 | Inbox messages already applied | `ingested_messages` | `IngestedMessages` |
 | Cloudflare Radar ranks (7 days) | `radar_domains` | `RadarDomains` |
 | Spotify / Rephonic lookups (7 days) | `podcast_shows` | `PodcastShows` |
+| Search roundup: web coverage of each speaker (insert-only) | `speaker_web_results` | `SpeakerWebResults` |
 
 Company schedule, recipients, and research notes live on the tenant record in the control database (`pipeline/registry.py`), not in the opportunity tables. Generated mail is also copied under `outbox/` as `.txt`, `.html`, and `.json`.
 
@@ -86,6 +87,10 @@ The tool is the Anthropic web search tool (`WEB_SEARCH_TOOL_TYPE`, default `web_
 Claude is always tried first. If that call errors and `RESEARCH_FALLBACK=foundry`, the same prompt continues on Azure AI Foundry (`pipeline/fallback.py`). A Foundry model whose name starts with `claude` uses the Messages API with web search; any other model uses the Responses API. After the first failure, the rest of that morning's people stay on Foundry. With no fallback configured, that person is recorded as an error and the run continues with everyone else. A credit-balance error stops further Claude calls for the rest of the run and is named at the top of the email.
 
 `--dry-run` and `DRY_RUN_RESEARCH` skip the API and return stub opportunities.
+
+### Search roundup
+
+Before `research_person()`, `_refresh_web_results()` in `pipeline/runner.py` calls `search_speaker_coverage()` in `pipeline/speaker_web.py`. It is one more web-search call (at most `SPEAKER_WEB_MAX_SEARCH_USES` searches) that asks for articles, interviews, podcasts, talks, and awards by or about that person at that firm. URLs already saved for them are listed in the prompt so they are not returned again. `is_listing_url()` drops author, profile, directory, tag, and social-profile pages so every link opens a single piece. New items are inserted into `speaker_web_results` keyed by `person_id` and URL fingerprint; existing rows are never rewritten. The newest five are added to the research prompt as context, and every saved coverage fingerprint is dropped from that person's opportunities. When Claude is down and `RESEARCH_FALLBACK=foundry`, the same prompt goes to Foundry. Any failure only warns.
 
 ### What is kept
 

@@ -28,6 +28,15 @@ class Settings:
     web_search_tool_type: str = os.getenv("WEB_SEARCH_TOOL_TYPE", "web_search_20250305")
     max_search_uses: int = int(os.getenv("MAX_SEARCH_USES", "5"))
     max_tokens: int = int(os.getenv("MAX_TOKENS", "4096"))
+    # Search roundup: before each person's research, look up coverage of that speaker
+    # and append anything new to their web_results. false turns it off.
+    speaker_web_search: bool = os.getenv("SPEAKER_WEB_SEARCH", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    speaker_web_max_search_uses: int = int(os.getenv("SPEAKER_WEB_MAX_SEARCH_USES", "5") or "5")
 
     # outbox | stdout | none | graph (outbox + Microsoft Graph send)
     delivery_mode: str = os.getenv("DELIVERY_MODE", "outbox")

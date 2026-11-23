@@ -40,7 +40,7 @@ After searching, respond with JSON only — no markdown fences, no extra prose.
 def _user_prompt(person: Spokesperson, avoidance: str = "", brief: str = "") -> str:
     prior = person.prior_work or "(none listed)"
     rules = f"\n{avoidance.strip()}\n" if avoidance.strip() else ""
-    notes = _brief_block(brief)
+    notes = _brief_block(brief) + _coverage_block(person)
     head = f"""Research earned-media opportunities for this spokesperson.
 
 Firm: {person.firm}
@@ -233,11 +233,11 @@ def _credit_status(exc: BaseException) -> int | None:
     return None
 
 
-def _web_search_tool() -> dict[str, Any]:
+def _web_search_tool(max_uses: int | None = None) -> dict[str, Any]:
     tool: dict[str, Any] = {
         "type": settings.web_search_tool_type,
         "name": "web_search",
-        "max_uses": settings.max_search_uses,
+        "max_uses": max_uses or settings.max_search_uses,
         "user_location": {
             "type": "approximate",
             "country": "US",
@@ -265,23 +265,41 @@ def _brief_block(brief: str) -> str:
     )
 
 
-def _run_live_research(
+def _coverage_block(person: Spokesperson, limit: int = 5) -> str:
+    """Recent coverage of this speaker from the Search roundup. Context only."""
+    lines = []
+    for item in person.web_results[:limit]:
+        summary = " ".join((item.summary or "").split())
+        if len(summary) > 300:
+            summary = summary[:297].rstrip() + "..."
+        outlet = f" ({item.outlet})" if item.outlet else ""
+        lines.append(f"- {item.title or 'Untitled'}{outlet}: {summary} {item.url}".rstrip())
+    if not lines:
+        return ""
+    return (
+        "\nRecent coverage of this speaker (context for angles and credibility; "
+        "do not return these links as opportunities):\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
+def _call_with_search(
     client: Any,
-    person: Spokesperson,
-    avoidance: str = "",
-    brief: str = "",
+    system: str,
+    prompt: str,
+    *,
+    max_uses: int | None = None,
 ) -> Any:
-    """Call Claude and continue if a long search returns pause_turn."""
-    messages: list[dict[str, Any]] = [
-        {"role": "user", "content": _user_prompt(person, avoidance, brief)}
-    ]
+    """One Messages call with web search. Continues if a long search returns pause_turn."""
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     last = None
     for _ in range(4):
         last = client.messages.create(
             model=settings.claude_model,
             max_tokens=settings.max_tokens,
-            system=SYSTEM,
-            tools=[_web_search_tool()],
+            system=system,
+            tools=[_web_search_tool(max_uses)],
             messages=messages,
         )
         if getattr(last, "stop_reason", None) != "pause_turn":
@@ -292,6 +310,16 @@ def _run_live_research(
     if last is None:
         raise RuntimeError("Claude returned no research response")
     return last
+
+
+def _run_live_research(
+    client: Any,
+    person: Spokesperson,
+    avoidance: str = "",
+    brief: str = "",
+) -> Any:
+    """Call Claude and continue if a long search returns pause_turn."""
+    return _call_with_search(client, SYSTEM, _user_prompt(person, avoidance, brief))
 
 
 def _extract_text(response: Any) -> str:

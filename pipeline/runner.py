@@ -14,6 +14,7 @@ from pipeline.models import Spokesperson
 from pipeline.research import ClaudeCreditError, format_credit_code, research_person
 from pipeline.roundup import PersonSection, ResearchNotice, build_roundup
 from pipeline.roster import load_roster_from_xlsx
+from pipeline.speaker_web import search_speaker_coverage
 from pipeline.podcasts import enrich_podcasts
 from pipeline.radar import enrich_opportunities as enrich_radar
 from pipeline.storage import LocalStore, open_store
@@ -28,6 +29,7 @@ class PersonRunResult:
     new: int = 0
     is_new_to_roster: bool = False
     error: str | None = None
+    web_new: int = 0
 
 
 @dataclass
@@ -44,6 +46,40 @@ class PipelineResult:
     @property
     def errors(self) -> list[PersonRunResult]:
         return [r for r in self.results if r.error]
+
+
+def _refresh_web_results(
+    store: LocalStore,
+    person: Spokesperson,
+    result: PersonRunResult,
+    *,
+    dry_run: bool,
+    use_fallback: bool,
+) -> set[str]:
+    """Search roundup: append new coverage of this speaker before their research.
+
+    Fills person.web_results (newest first) so the research prompt can use it,
+    and returns every saved coverage fingerprint. A failure here only warns;
+    it never stops that person's roundup.
+    """
+    try:
+        known = store.web_results(person.person_id)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"  [yellow]web results unavailable: {exc}[/]")
+        return set()
+    if settings.speaker_web_search:
+        try:
+            found, _model = search_speaker_coverage(
+                person, known, dry_run=dry_run, use_fallback=use_fallback
+            )
+            added = store.add_web_results(person.person_id, found)
+            result.web_new = len(added)
+            console.print(f"  web results: {len(added)} new")
+            known = added + known
+        except Exception as exc:  # noqa: BLE001 — coverage is optional
+            console.print(f"  [yellow]web results search failed: {exc}[/]")
+    person.web_results = known
+    return {item.fingerprint for item in known}
 
 
 def sync_roster(store: LocalStore | None = None) -> tuple[LocalStore, int, list[Spokesperson]]:
@@ -206,6 +242,13 @@ def _execute_run(
             console.print(f"  [yellow]{result.error}[/]")
             outcome.results.append(result)
             continue
+        covered = _refresh_web_results(
+            store,
+            person,
+            result,
+            dry_run=dry_run,
+            use_fallback=claude_down and use_fallback,
+        )
         try:
             research = research_person(
                 person,
@@ -240,7 +283,12 @@ def _execute_run(
             result.found = len(research.opportunities)
             fresh = store.filter_new(person.person_id, research.opportunities)
             blocked = store.rejected_fingerprints()
-            kept = [opp for opp in fresh if opp.fingerprint not in blocked]
+            # Coverage of the speaker is context, not something to pitch.
+            kept = [
+                opp
+                for opp in fresh
+                if opp.fingerprint not in blocked and opp.fingerprint not in covered
+            ]
             skipped = len(fresh) - len(kept)
             if skipped:
                 console.print(

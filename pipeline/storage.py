@@ -19,6 +19,7 @@ from pipeline.models import (
     RadarMetrics,
     SiteMetrics,
     Spokesperson,
+    WebResult,
 )
 
 
@@ -112,6 +113,21 @@ CREATE INDEX IF NOT EXISTS idx_action_token ON action_jobs(token, created_at);
 CREATE TABLE IF NOT EXISTS ingested_messages (
     message_id  TEXT PRIMARY KEY,
     ingested_at TEXT NOT NULL
+);
+
+-- Coverage of each speaker found by web search. Insert-only: a run adds rows
+-- and never rewrites them, and roster syncs do not touch this table.
+CREATE TABLE IF NOT EXISTS speaker_web_results (
+    person_id    TEXT NOT NULL,
+    fingerprint  TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    title        TEXT,
+    outlet       TEXT,
+    kind         TEXT,
+    summary      TEXT,
+    published_on TEXT,
+    found_at     TEXT NOT NULL,
+    PRIMARY KEY (person_id, fingerprint)
 );
 """
 
@@ -323,6 +339,65 @@ class LocalStore:
                 "DELETE FROM sent_opportunities WHERE person_id = ?",
                 (person_id,),
             )
+        return deleted > 0
+
+    def web_results(self, person_id: str, limit: int | None = None) -> list[WebResult]:
+        """Coverage found for one speaker, newest first."""
+        sql = (
+            "SELECT * FROM speaker_web_results WHERE person_id = ? "
+            "ORDER BY found_at DESC, rowid DESC"
+        )
+        params: tuple = (person_id,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (person_id, int(limit))
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_web_result_row(r) for r in rows]
+
+    def web_result_counts(self) -> dict[str, int]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT person_id, COUNT(*) AS n FROM speaker_web_results GROUP BY person_id"
+            ).fetchall()
+        return {r["person_id"]: int(r["n"]) for r in rows}
+
+    def add_web_results(self, person_id: str, items: list[WebResult]) -> list[WebResult]:
+        """Append new coverage. Existing rows are never changed. Returns what was inserted."""
+        added: list[WebResult] = []
+        with self._conn() as conn:
+            for item in items:
+                if not item.url or not item.fingerprint:
+                    continue
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO speaker_web_results
+                    (person_id, fingerprint, url, title, outlet, kind, summary,
+                     published_on, found_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        person_id,
+                        item.fingerprint,
+                        item.url,
+                        item.title,
+                        item.outlet,
+                        item.kind,
+                        item.summary,
+                        item.published_on,
+                        item.found_at,
+                    ),
+                )
+                if cur.rowcount:
+                    added.append(item)
+        return added
+
+    def delete_web_result(self, person_id: str, fingerprint: str) -> bool:
+        with self._conn() as conn:
+            deleted = conn.execute(
+                "DELETE FROM speaker_web_results WHERE person_id = ? AND fingerprint = ?",
+                (person_id, fingerprint),
+            ).rowcount
         return deleted > 0
 
     def already_sent(self, person_id: str, fingerprint: str) -> bool:
@@ -977,6 +1052,19 @@ def _spokesperson_row(row: sqlite3.Row) -> Spokesperson:
         prior_work=row["prior_work"] or "",
         bio=row["bio"] or "",
         email=row["email"],
+    )
+
+
+def _web_result_row(row: sqlite3.Row) -> WebResult:
+    return WebResult(
+        url=row["url"],
+        fingerprint=row["fingerprint"],
+        title=row["title"] or "",
+        outlet=row["outlet"] or "",
+        kind=row["kind"] or "other",
+        summary=row["summary"] or "",
+        published_on=row["published_on"] or None,
+        found_at=row["found_at"] or "",
     )
 
 
