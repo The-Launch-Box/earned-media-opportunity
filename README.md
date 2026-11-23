@@ -53,6 +53,10 @@ python -m pipeline run              # live search + send
 # Inspect dedupe store
 python -m pipeline sent
 
+# Search roundup only: find new web coverage of each speaker (sends nothing)
+python -m pipeline coverage --person "Amy Kenly"
+python -m pipeline coverage --dry-run --limit 1
+
 # Cloudflare Radar site traffic for one outlet domain
 python -m pipeline site cio.com
 python -m pipeline radar --dry-run example.com
@@ -96,6 +100,12 @@ The app is a morning research job plus a small website for the Yes/No links. On 
 4. When `CLOUDFLARE_API_TOKEN` is set, it asks Cloudflare Radar for each outlet domain’s traffic rank and caches that for a week. Podcast items that match a Spotify show get subscriber and monthly listener counts when Spotify returns them, plus episode count, publisher, and the newest episode date.
 5. It writes one team email: Time-Sensitive first, then Other, grouped by person. With `DELIVERY_MODE=graph`, Microsoft Graph sends that HTML from your mailbox to `BLAST_TO`. A copy also lands in `outbox/`.
 6. It records each URL it sent, so the next run skips it.
+
+### Search roundup
+
+Before each person's opportunity search, a second Claude web-search call looks for public coverage of that speaker at that firm: articles, interviews, podcasts, talks, and awards. Anything new is added to the speaker's `web_results` with a 1–2 sentence summary. Nothing already saved is changed or removed, and a roster sync from the workbook does not touch it. The dashboard shows it on the speaker's **Search roundup** tab (`/speakers/<id>/roundup`), next to **Bio**; Remove there is the only delete. The five most recent items go into that speaker's research prompt as context, and their URLs are never sent back as opportunities.
+
+This roughly doubles Claude calls and run time. `SPEAKER_WEB_MAX_SEARCH_USES` (default 3) caps the searches per speaker, and `SPEAKER_WEB_SEARCH=false` turns it off. A failure here only prints a warning; the roundup still runs.
 
 The email’s Yes and No buttons are links. They only work if `python -m pipeline serve` is still running, because the morning job has already exited. No opens a page that asks why. Save writes that reason into SQLite. The next morning’s Claude call is told to avoid opportunities like that one.
 

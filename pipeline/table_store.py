@@ -17,6 +17,7 @@ from pipeline.models import (
     RadarMetrics,
     SiteMetrics,
     Spokesperson,
+    WebResult,
 )
 from pipeline.storage import ActionJob, FeedbackRecord, _fresh_payload
 
@@ -95,6 +96,7 @@ class TableStore:
         self._batches = service.create_table_if_not_exists(table("RoundupBatches"))
         self._actions = service.create_table_if_not_exists(table("ActionJobs"))
         self._ingested = service.create_table_if_not_exists(table("IngestedMessages"))
+        self._web = service.create_table_if_not_exists(table("SpeakerWebResults"))
 
     def roster_ids(self) -> set[str]:
         return {entity["RowKey"] for entity in self._roster.list_entities()}
@@ -185,6 +187,57 @@ class TableStore:
         )
         for entity in sent:
             self._sent.delete_entity(entity["PartitionKey"], entity["RowKey"])
+        return True
+
+    def web_results(self, person_id: str, limit: int | None = None) -> list[WebResult]:
+        """Coverage found for one speaker, newest first."""
+        entities = self._web.query_entities(
+            query_filter=f"PartitionKey eq {_q(person_id)}"
+        )
+        items = [_web_result(entity) for entity in entities]
+        items.sort(key=lambda item: item.found_at, reverse=True)
+        return items[:limit] if limit is not None else items
+
+    def web_result_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for entity in self._web.list_entities(select=["PartitionKey"]):
+            key = _text(entity.get("PartitionKey"))
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def add_web_results(self, person_id: str, items: list[WebResult]) -> list[WebResult]:
+        """Append new coverage. Existing rows are never changed. Returns what was inserted."""
+        from azure.core.exceptions import ResourceExistsError
+
+        added: list[WebResult] = []
+        for item in items:
+            if not item.url or not item.fingerprint:
+                continue
+            try:
+                self._web.create_entity(
+                    {
+                        "PartitionKey": person_id,
+                        "RowKey": item.fingerprint,
+                        "url": item.url,
+                        "title": item.title,
+                        "outlet": item.outlet,
+                        "kind": item.kind,
+                        "summary": item.summary,
+                        "published_on": item.published_on or "",
+                        "found_at": item.found_at,
+                    }
+                )
+            except ResourceExistsError:
+                continue
+            added.append(item)
+        return added
+
+    def delete_web_result(self, person_id: str, fingerprint: str) -> bool:
+        try:
+            self._web.get_entity(person_id, fingerprint)
+        except _not_found():
+            return False
+        self._web.delete_entity(person_id, fingerprint)
         return True
 
     def already_sent(self, person_id: str, fingerprint: str) -> bool:
@@ -713,6 +766,19 @@ def _spokesperson(entity: dict) -> Spokesperson:
         prior_work=_text(entity.get("prior_work")),
         bio=_text(entity.get("bio")),
         email=email or None,
+    )
+
+
+def _web_result(entity: dict) -> WebResult:
+    return WebResult(
+        url=_text(entity.get("url")),
+        fingerprint=_text(entity.get("RowKey")),
+        title=_text(entity.get("title")),
+        outlet=_text(entity.get("outlet")),
+        kind=_text(entity.get("kind")) or "other",
+        summary=_text(entity.get("summary")),
+        published_on=_text(entity.get("published_on")) or None,
+        found_at=_text(entity.get("found_at")),
     )
 
 

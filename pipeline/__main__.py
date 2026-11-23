@@ -117,6 +117,44 @@ def cmd_auth(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_coverage(args: argparse.Namespace) -> int:
+    """Search roundup only: append new web coverage for each speaker. Sends nothing."""
+    from pipeline.speaker_web import search_speaker_coverage
+
+    store, _, _ = sync_roster()
+    people = store.list_roster()
+    if args.firm:
+        people = [p for p in people if p.firm.lower() == args.firm.lower()]
+    if args.person:
+        needle = args.person.lower()
+        people = [p for p in people if needle in p.name.lower()]
+    if args.limit is not None:
+        people = people[: args.limit]
+    if not people:
+        console.print("[red]No speakers matched.[/]")
+        return 1
+    failures = 0
+    for person in people:
+        console.print(f"[bold]{person.firm}[/] · {person.name}", highlight=False)
+        known = store.web_results(person.person_id)
+        try:
+            found, model = search_speaker_coverage(person, known, dry_run=args.dry_run)
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            console.print(f"  [red]error:[/] {exc}")
+            continue
+        added = store.add_web_results(person.person_id, found)
+        console.print(
+            f"  {len(added)} new, {len(known) + len(added)} on file ({model})",
+            highlight=False,
+        )
+        for item in added:
+            console.print(f"  + {item.title} — {item.url}", highlight=False)
+            if item.summary:
+                console.print(f"    {item.summary}", highlight=False)
+    return 1 if failures == len(people) else 0
+
+
 def cmd_sent(args: argparse.Namespace) -> int:
     store = open_store()
     console.print(f"Total sent fingerprints: {store.sent_count()}")
@@ -413,6 +451,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Key Vault URL, e.g. https://kv-tlb-emo.vault.azure.net/",
     )
     p_auth.set_defaults(func=cmd_auth)
+
+    p_coverage = sub.add_parser(
+        "coverage",
+        help="Search roundup only: find new web coverage of each speaker (sends nothing)",
+    )
+    p_coverage.add_argument("--dry-run", action="store_true", help="Stub results, no API calls")
+    p_coverage.add_argument("--person", help="Only names containing this string")
+    p_coverage.add_argument("--firm", help="Only this firm (exact, case-insensitive)")
+    p_coverage.add_argument("--limit", type=int, help="At most N people")
+    p_coverage.set_defaults(func=cmd_coverage)
 
     p_sent = sub.add_parser("sent", help="Show how many opportunities have been filed as sent")
     p_sent.add_argument("--dump", action="store_true", help="Dump full SQLite debug JSON")

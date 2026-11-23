@@ -131,12 +131,54 @@ def parse_foundry_output(payload: dict[str, Any]) -> tuple[str, int]:
 def _foundry(
     client: httpx.Client, person: Spokesperson, avoidance: str, brief: str = ""
 ) -> ResearchResult:
+    text, searches, model_name = _foundry_text(
+        client, SYSTEM, _user_prompt(person, avoidance, brief)
+    )
+    return _result_from_text(
+        person,
+        text,
+        search_count=searches,
+        model_name=model_name,
+        provider="foundry",
+    )
+
+
+def foundry_search_text(
+    system: str,
+    prompt: str,
+    *,
+    max_uses: int | None = None,
+    http: httpx.Client | None = None,
+) -> tuple[str, int, str]:
+    """Any web-search prompt on Foundry. Returns (text, searches, model label)."""
+    if settings.research_fallback != "foundry":
+        raise FallbackError(
+            "RESEARCH_FALLBACK must be 'foundry' "
+            f"(got {settings.research_fallback or 'empty'})."
+        )
+    client = http or httpx.Client(timeout=300.0)
+    try:
+        return _foundry_text(client, system, prompt, max_uses=max_uses)
+    finally:
+        if http is None:
+            client.close()
+
+
+def _foundry_text(
+    client: httpx.Client,
+    system: str,
+    prompt: str,
+    *,
+    max_uses: int | None = None,
+) -> tuple[str, int, str]:
     if not settings.foundry_endpoint or not settings.foundry_api_key or not settings.foundry_model:
         raise FallbackError(
             "Foundry fallback needs FOUNDRY_ENDPOINT, FOUNDRY_API_KEY, and FOUNDRY_MODEL."
         )
+    model_name = f"{settings.foundry_model} (Azure AI Foundry)"
     if uses_claude_messages(settings.foundry_model):
-        return _foundry_claude(client, person, avoidance, brief)
+        text, searches = _foundry_claude(client, system, prompt, max_uses)
+        return text, searches, model_name
     url = foundry_responses_url(settings.foundry_endpoint)
     response = client.post(
         url,
@@ -146,30 +188,22 @@ def _foundry(
         },
         json={
             "model": settings.foundry_model,
-            "instructions": SYSTEM,
-            "input": _user_prompt(person, avoidance, brief),
+            "instructions": system,
+            "input": prompt,
             "tools": [{"type": "web_search"}],
             "max_output_tokens": settings.max_tokens,
         },
     )
     payload = _json_or_error(response, "Foundry")
     text, searches = parse_foundry_output(payload)
-    return _result_from_text(
-        person,
-        text,
-        search_count=searches,
-        model_name=f"{settings.foundry_model} (Azure AI Foundry)",
-        provider="foundry",
-    )
+    return text, searches, model_name
 
 
 def _foundry_claude(
-    client: httpx.Client, person: Spokesperson, avoidance: str, brief: str
-) -> ResearchResult:
+    client: httpx.Client, system: str, prompt: str, max_uses: int | None = None
+) -> tuple[str, int]:
     url = foundry_messages_url(settings.foundry_endpoint)
-    messages: list[dict[str, Any]] = [
-        {"role": "user", "content": _user_prompt(person, avoidance, brief)}
-    ]
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
     text = ""
     searches = 0
     for _ in range(4):
@@ -183,9 +217,9 @@ def _foundry_claude(
             json={
                 "model": settings.foundry_model,
                 "max_tokens": settings.max_tokens,
-                "system": SYSTEM,
+                "system": system,
                 "messages": messages,
-                "tools": [_foundry_search_tool()],
+                "tools": [_foundry_search_tool(max_uses)],
             },
         )
         payload = _json_or_error(response, "Foundry")
@@ -194,20 +228,14 @@ def _foundry_claude(
         if payload.get("stop_reason") != "pause_turn":
             break
         messages.append({"role": "assistant", "content": payload.get("content") or []})
-    return _result_from_text(
-        person,
-        text,
-        search_count=searches,
-        model_name=f"{settings.foundry_model} (Azure AI Foundry)",
-        provider="foundry",
-    )
+    return text, searches
 
 
-def _foundry_search_tool() -> dict[str, Any]:
+def _foundry_search_tool(max_uses: int | None = None) -> dict[str, Any]:
     return {
         "type": FOUNDRY_CLAUDE_SEARCH,
         "name": "web_search",
-        "max_uses": settings.max_search_uses,
+        "max_uses": max_uses or settings.max_search_uses,
         "user_location": {"type": "approximate", "country": "US"},
     }
 

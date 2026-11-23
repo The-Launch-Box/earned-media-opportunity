@@ -21,6 +21,31 @@ def url_fingerprint(url: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()[:24]
 
 
+class WebResult(BaseModel):
+    """One piece of published coverage by or about a speaker, found by web search.
+
+    Stored per speaker in speaker_web_results. Rows are only ever added; a run
+    never edits or removes what is already there.
+    """
+
+    url: str
+    fingerprint: str = ""
+    title: str = ""
+    outlet: str = ""
+    kind: str = "other"  # article | interview | podcast | talk | award | other
+    summary: str = ""
+    published_on: str | None = None
+    found_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    @model_validator(mode="after")
+    def ensure_fingerprint(self) -> WebResult:
+        if not self.fingerprint and self.url:
+            self.fingerprint = url_fingerprint(self.url)
+        return self
+
+
 class Spokesperson(BaseModel):
     person_id: str
     firm: str
@@ -31,6 +56,8 @@ class Spokesperson(BaseModel):
     prior_work: str = ""
     bio: str = ""
     email: str | None = None
+    # Filled by the store on request (speaker_web_results). Never written to the roster row.
+    web_results: list[WebResult] = Field(default_factory=list)
 
     @classmethod
     def from_row(

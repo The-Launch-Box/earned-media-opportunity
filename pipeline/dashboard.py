@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 from pipeline.jobs import RunInProgress, enqueue_run
-from pipeline.models import Spokesperson
+from pipeline.models import Spokesperson, WebResult
 from pipeline.ms_login import (
     SILENT_FAILURES,
     begin_flow,
@@ -58,9 +58,11 @@ _STYLES = Path(__file__).with_name("dashboard_theme.css").read_text(encoding="ut
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PERSON = re.compile(r"^[0-9a-f]{16}$")
+_FINGERPRINT = re.compile(r"^[0-9a-f]{24}$")
 _NOTICES = {
     "saved": "Speaker saved.",
     "deleted": "Speaker removed. Opportunities already sent to them were cleared.",
+    "web-removed": "Removed from this speaker's search roundup.",
     "queued": "Run queued. It starts within a minute. This page refreshes until it finishes.",
     "running": "Run started. This page refreshes until it finishes.",
     "schedule": "Schedule saved. Nothing was sent.",
@@ -228,8 +230,23 @@ def _dispatch(method: str, target: str, headers: dict, body: bytes) -> HttpResul
         return _speaker_form(tenant, session, None, [])
     if parts == ["speakers"] and method == "POST":
         return _save_speaker(tenant, session, form, None)
-    if len(parts) == 3 and parts[0] == "speakers" and parts[2] == "edit" and method == "GET":
+    if (
+        len(parts) == 3
+        and parts[0] == "speakers"
+        and parts[2] in {"edit", "bio"}
+        and method == "GET"
+    ):
         return _edit(tenant, session, parts[1])
+    if len(parts) == 3 and parts[0] == "speakers" and parts[2] == "roundup" and method == "GET":
+        return _web_tab(tenant, session, parts[1], query.get("notice", ""))
+    if (
+        len(parts) == 5
+        and parts[0] == "speakers"
+        and parts[2] == "roundup"
+        and parts[4] == "delete"
+        and method == "POST"
+    ):
+        return _delete_web(tenant, parts[1], parts[3])
     if len(parts) == 2 and parts[0] == "speakers" and method == "POST":
         return _save_speaker(tenant, session, form, parts[1])
     if len(parts) == 3 and parts[0] == "speakers" and parts[2] == "delete" and method == "GET":
@@ -568,7 +585,8 @@ def _saved_notes(tenant: Tenant) -> str:
 
 def _speakers(tenant: Tenant, session: dict, notice: str) -> HttpResult:
     try:
-        people = _roster(tenant)
+        store = _roster_store(tenant)
+        people = store.list_roster()
     except Exception:
         logger.exception("Could not load speakers for %s", tenant.slug)
         body = (
@@ -577,9 +595,16 @@ def _speakers(tenant: Tenant, session: dict, notice: str) -> HttpResult:
             '<p class="warn">The speaker list could not be opened. Refresh and try again.</p>'
         )
         return HttpResult(200, _shell(tenant, session, body, section="speakers"))
+    try:
+        counts = store.web_result_counts()
+    except Exception:
+        logger.exception("Could not count web results for %s", tenant.slug)
+        counts = {}
     rows = []
     for person in people:
         topics = person.topics if len(person.topics) <= 80 else person.topics[:77] + "..."
+        pid = escape(person.person_id)
+        found = counts.get(person.person_id, 0)
         rows.append(
             "<tr>"
             f"<td>{escape(person.name)}</td>"
@@ -587,7 +612,8 @@ def _speakers(tenant: Tenant, session: dict, notice: str) -> HttpResult:
             f"<td>{escape(person.title)}</td>"
             f"<td>{escape(topics)}</td>"
             f"<td>{escape(person.email or '')}</td>"
-            f'<td><a href="/speakers/{escape(person.person_id)}/edit">Edit</a></td>'
+            f'<td><a href="/speakers/{pid}/roundup">{found} found</a></td>'
+            f'<td><a href="/speakers/{pid}/bio">Bio</a></td>'
             "</tr>"
         )
     table = (
@@ -595,7 +621,7 @@ def _speakers(tenant: Tenant, session: dict, notice: str) -> HttpResult:
         if not rows
         else (
             '<div class="table-wrap"><table><thead><tr><th>Name</th><th>Firm</th><th>Title</th>'
-            "<th>Topics</th><th>Email</th><th></th></tr></thead><tbody>"
+            "<th>Topics</th><th>Email</th><th>Search roundup</th><th></th></tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table></div>"
         )
@@ -639,7 +665,8 @@ def _speaker_form(
             "email": person.email or "",
         }
     action = "/speakers" if person is None else f"/speakers/{person.person_id}"
-    title = "Add a speaker" if person is None else f"Edit {person.name}"
+    title = "Add a speaker" if person is None else person.name
+    tabs = "" if person is None else _speaker_tabs(person, "bio")
     error_html = "".join(f'<p class="warn">{escape(item)}</p>' for item in errors)
     fields = [
         ("firm", "Firm", "text", True),
@@ -673,7 +700,7 @@ def _speaker_form(
         )
     body = (
         f'<p class="eyebrow">{escape(tenant.name)}</p>'
-        f"<h1>{escape(title)}</h1>{error_html}"
+        f"<h1>{escape(title)}</h1>{tabs}{error_html}"
         f'<form class="panel" method="post" action="{escape(action)}">'
         f'<input type="hidden" name="csrf" value="{escape(str(session.get("csrf") or ""))}">'
         + "".join(inputs)
@@ -726,7 +753,7 @@ def _delete_prompt(tenant: Tenant, session: dict, person_id: str) -> HttpResult:
         f'<form method="post" action="/speakers/{escape(person_id)}/delete">'
         f'<input type="hidden" name="csrf" value="{escape(str(session.get("csrf") or ""))}">'
         '<button class="danger" type="submit">Delete speaker</button></form>'
-        f'<p><a href="/speakers/{escape(person_id)}/edit">Keep this speaker</a></p>'
+        f'<p><a href="/speakers/{escape(person_id)}/bio">Keep this speaker</a></p>'
     )
     return HttpResult(200, _shell(tenant, session, body, section="speakers"))
 
@@ -737,6 +764,83 @@ def _delete_speaker(tenant: Tenant, session: dict, person_id: str) -> HttpResult
     if not _roster_store(tenant).delete_person(person_id):
         return HttpResult(404, _shell(tenant, session, "<h1>Speaker not found</h1>"))
     return _redirect("/speakers", notice="deleted")
+
+
+def _speaker_tabs(person: Spokesperson, active: str) -> str:
+    pid = escape(person.person_id)
+    links = []
+    for key, label in (("bio", "Bio"), ("roundup", "Search roundup")):
+        current = ' class="current" aria-current="page"' if key == active else ""
+        links.append(f'<a{current} href="/speakers/{pid}/{key}">{label}</a>')
+    return '<nav class="tabs" aria-label="Speaker">' + "".join(links) + "</nav>"
+
+
+def _web_tab(tenant: Tenant, session: dict, person_id: str, notice: str) -> HttpResult:
+    if not _PERSON.match(person_id):
+        return HttpResult(404, _shell(tenant, session, "<h1>Speaker not found</h1>"))
+    store = _roster_store(tenant)
+    person = store.get_person(person_id)
+    if person is None:
+        return HttpResult(404, _shell(tenant, session, "<h1>Speaker not found</h1>"))
+    items = store.web_results(person_id)
+    csrf = escape(str(session.get("csrf") or ""))
+    if items:
+        cards = "".join(_web_card(person_id, item, csrf) for item in items)
+        listing = f'<ul class="web-results">{cards}</ul>'
+    else:
+        listing = (
+            '<p class="muted">Nothing found yet. The next run searches the web for this speaker.</p>'
+        )
+    body = (
+        f'<p class="eyebrow">{escape(tenant.name)}</p>'
+        f"<h1>{escape(person.name)}</h1>"
+        + _speaker_tabs(person, "roundup")
+        + _notice(notice)
+        + '<p class="muted">Articles, interviews, podcasts, and talks by or about '
+        f"{escape(person.name)} at {escape(person.firm)}, found by web search before each run. "
+        "New finds are added; nothing here is replaced.</p>"
+        + listing
+    )
+    return HttpResult(200, _shell(tenant, session, body, section="speakers"))
+
+
+def _web_card(person_id: str, item: WebResult, csrf: str) -> str:
+    url = item.url if item.url.lower().startswith(("http://", "https://")) else ""
+    title = escape(item.title or "Untitled")
+    link = (
+        f'<a href="{escape(url)}" target="_blank" rel="noopener noreferrer">{title}</a>'
+        if url
+        else title
+    )
+    meta = [escape(item.outlet)] if item.outlet else []
+    if item.kind and item.kind != "other":
+        meta.append(escape(item.kind.capitalize()))
+    if item.published_on:
+        meta.append(f"Published {escape(item.published_on)}")
+    found = item.found_at[:10] if item.found_at else ""
+    if found:
+        meta.append(f"Found {escape(found)}")
+    summary = (
+        f'<p class="web-summary">{escape(item.summary)}</p>' if item.summary else ""
+    )
+    action = f"/speakers/{escape(person_id)}/roundup/{escape(item.fingerprint)}/delete"
+    return (
+        '<li class="web-result">'
+        + summary
+        + f'<p class="web-link">{link}</p>'
+        + (f'<p class="web-meta muted">{" · ".join(meta)}</p>' if meta else "")
+        + f'<form method="post" action="{action}">'
+        f'<input type="hidden" name="csrf" value="{csrf}">'
+        '<button class="quiet small" type="submit">Remove</button></form>'
+        "</li>"
+    )
+
+
+def _delete_web(tenant: Tenant, person_id: str, fingerprint: str) -> HttpResult:
+    if not _PERSON.match(person_id) or not _FINGERPRINT.match(fingerprint):
+        return _redirect("/speakers")
+    _roster_store(tenant).delete_web_result(person_id, fingerprint)
+    return _redirect(f"/speakers/{person_id}/roundup", notice="web-removed")
 
 
 def _schedule_form(
