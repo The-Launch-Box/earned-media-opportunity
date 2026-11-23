@@ -36,7 +36,7 @@ class Settings:
         "no",
         "off",
     }
-    speaker_web_max_search_uses: int = int(os.getenv("SPEAKER_WEB_MAX_SEARCH_USES", "3") or "3")
+    speaker_web_max_search_uses: int = int(os.getenv("SPEAKER_WEB_MAX_SEARCH_USES", "5") or "5")
 
     # outbox | stdout | none | graph (outbox + Microsoft Graph send)
     delivery_mode: str = os.getenv("DELIVERY_MODE", "outbox")

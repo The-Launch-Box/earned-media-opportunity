@@ -10,7 +10,12 @@ from pipeline.registry import Tenant
 from pipeline.research import _user_prompt
 from pipeline.runner import PersonRunResult, _refresh_web_results
 from pipeline.session import COOKIE, encode_session
-from pipeline.speaker_web import coverage_prompt, parse_results, search_speaker_coverage
+from pipeline.speaker_web import (
+    coverage_prompt,
+    is_listing_url,
+    parse_results,
+    search_speaker_coverage,
+)
 from pipeline.storage import LocalStore
 
 
@@ -96,6 +101,46 @@ def test_parse_results_drops_bad_urls_and_duplicates() -> None:
     assert results[0].published_on == "2026-11-01"
     assert results[1].kind == "other"
     assert results[1].published_on is None
+
+
+def test_listing_pages_are_rejected() -> None:
+    rejected = [
+        "https://www.cmswire.com/author/lindsey-hawkins/",
+        "https://example-news.com/contributors/jane-doe",
+        "https://www.linkedin.com/in/lindseyhawkins",
+        "https://www.linkedin.com/company/blue-trail-digital/",
+        "https://x.com/lindseyhawkins",
+        "https://www.crunchbase.com/person/lindsey-hawkins",
+        "https://bluetraildigital.com/team/lindsey-hawkins",
+        "https://trade.example.org/tag/pricing",
+        "https://trade.example.org/",
+    ]
+    kept = [
+        "https://www.cmswire.com/digital-asset-management/dam-under-pressure/",
+        "https://www.linkedin.com/pulse/content-ops-lindsey-hawkins",
+        "https://x.com/lindseyhawkins/status/1234567890",
+        "https://www.theatlantic.com/archive/2026/11/some-story/",
+        "https://news.example.org/topics/ai/what-cios-want-next",
+        "https://conf.example.org/speakers/lindsey-hawkins",
+        "https://podcasts.example.org/episodes/42-content-ops",
+    ]
+    assert [u for u in rejected if not is_listing_url(u)] == []
+    assert [u for u in kept if is_listing_url(u)] == []
+
+    text = (
+        '{"results": [{"title": "Author page", "url": "https://www.cmswire.com/author/lindsey-hawkins/"},'
+        '{"title": "Article", "url": "https://www.cmswire.com/dam/dam-under-pressure/"}]}'
+    )
+    assert [r.title for r in parse_results(text)] == ["Article"]
+
+
+def test_lookback_stays_long_until_three_real_items() -> None:
+    person = _person()
+    stub = WebResult(url="https://example.com/coverage/stub", title="stub")
+    assert "12 months" in coverage_prompt(person, [])
+    assert "12 months" in coverage_prompt(person, [stub, _item(1), _item(2)])
+    assert "last 30 days" in coverage_prompt(person, [_item(1), _item(2), _item(3)])
+    assert "author pages" in coverage_prompt.__globals__["SYSTEM"]
 
 
 def test_known_urls_are_listed_and_filtered() -> None:

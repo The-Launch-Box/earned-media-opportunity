@@ -9,6 +9,7 @@ removed; the dashboard's Remove button is the only delete.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from pipeline.config import settings
 from pipeline.models import Spokesperson, WebResult, url_fingerprint
@@ -21,6 +22,32 @@ from pipeline.research import (
 KINDS = {"article", "interview", "podcast", "talk", "award", "other"}
 MAX_NEW = 8
 MAX_KNOWN_IN_PROMPT = 40
+# Fewer than this many real items on file → search the last 12 months, not 30 days.
+BACKFILL_BELOW = 3
+
+# Path segments that start a page about a person or a list of pieces, rather than
+# one piece of coverage. Only a listing when at most one more segment follows
+# (/author/jane-doe, /tag/pricing), so /archive/2026/11/slug still counts.
+_LISTING_SEGMENTS = frozenset(
+    {
+        "author", "authors", "contributor", "contributors", "writer", "writers",
+        "profile", "profiles", "people", "person", "team", "our-team", "staff",
+        "leadership", "bio", "bios", "expert", "experts", "member", "members",
+        "user", "users", "tag", "tags", "category", "categories", "topic",
+        "topics", "search", "archive", "archives",
+    }
+)
+_PROFILE_HOSTS = {
+    "crunchbase.com",
+    "zoominfo.com",
+    "rocketreach.co",
+    "apollo.io",
+    "signalhire.com",
+    "theorg.com",
+    "muckrack.com",
+    "facebook.com",
+    "instagram.com",
+}
 
 SYSTEM = """You research public coverage of one professional for their marketing team.
 
@@ -31,7 +58,10 @@ webinars, awards, and press releases that name them.
 You MUST use the web_search tool. Do not rely on training data.
 Use the firm, title, and LinkedIn profile to make sure each result is about this \
 person and not someone else with the same name. Leave out anything you are not sure of.
-Leave out their own LinkedIn profile, the firm's staff bio page, and directory listings.
+
+Every URL must open the specific piece itself: the article, episode, interview, session page, award announcement, or press release. Never return author pages, contributor or profile pages, staff bios, speaker directories, tag or category listings, search results, or social profiles. If a search turns up an author page, open or search again to find the individual article URLs on it, and return those.
+
+Search broadly before answering. Use several distinct searches, for example: the name in quotes with the firm, the name with "podcast" or "episode", the name with "webinar", "panel", or "keynote", the name with "interview" or "says", and the outlets listed under their prior work.
 
 Always copy real URLs from your web search results. Do not invent links.
 After searching, respond with JSON only — no markdown fences, no extra prose.
@@ -39,9 +69,10 @@ After searching, respond with JSON only — no markdown fences, no extra prose.
 
 
 def coverage_prompt(person: Spokesperson, known: list[WebResult]) -> str:
+    real = [item for item in known if not _is_stub(item)]
     window = (
         "Look back about 12 months."
-        if not known
+        if len(real) < BACKFILL_BELOW
         else "Focus on anything published in roughly the last 30 days."
     )
     skip = ""
@@ -149,7 +180,7 @@ def _to_result(item: Any) -> WebResult | None:
     if not isinstance(item, dict):
         return None
     url = str(item.get("url") or "").strip()
-    if not url.lower().startswith(("http://", "https://")):
+    if not url.lower().startswith(("http://", "https://")) or is_listing_url(url):
         return None
     kind = str(item.get("kind") or "other").strip().lower()
     published = item.get("published_on")
@@ -164,6 +195,31 @@ def _to_result(item: Any) -> WebResult | None:
         summary=_clip(item.get("summary"), 600),
         published_on=_clip(published, 40) or None,
     )
+
+
+def is_listing_url(url: str) -> bool:
+    """True for pages about a person (author, profile, directory), not a piece of coverage."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    path = parsed.path or "/"
+    if path.strip("/") == "":
+        return True  # a bare homepage is not a piece of coverage
+    if host.endswith("linkedin.com"):
+        # Their own profile or company page; LinkedIn articles (/pulse/) are kept.
+        return not path.lower().startswith("/pulse/")
+    if host in {"x.com", "twitter.com"}:
+        return "/status/" not in path
+    if host in _PROFILE_HOSTS or any(host.endswith("." + h) for h in _PROFILE_HOSTS):
+        return True
+    segments = [seg for seg in path.lower().split("/") if seg]
+    for index, segment in enumerate(segments):
+        if segment in _LISTING_SEGMENTS and len(segments) - index - 1 <= 1:
+            return True
+    return False
+
+
+def _is_stub(item: WebResult) -> bool:
+    return (urlparse(item.url).hostname or "").lower() == "example.com"
 
 
 def _clip(value: Any, limit: int) -> str:
